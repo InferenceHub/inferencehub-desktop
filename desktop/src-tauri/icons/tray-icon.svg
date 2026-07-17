@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <!-- Monochrome "X" mark for the menu-bar tray (template image; macOS recolors it). -->
+  <g fill="black">
+    <path d="M8 11 L24 11 L33.5 26.5 L27 29.5 Z"/>
+    <path d="M8 53 L24 53 L33.5 37.5 L27 34.5 Z"/>
+    <path d="M56 11 L40 11 L30.5 26.5 L37 29.5 Z"/>
+    <path d="M56 53 L40 53 L30.5 37.5 L37 34.5 Z"/>
+  </g>
+</svg>

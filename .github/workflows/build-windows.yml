@@ -1,0 +1,114 @@
+name: Build Windows (unsigned)
+
+# Windows x64 counterpart of build-macos.yml: builds an UNSIGNED NSIS installer of the thin Tauri
+# client and, on a v* tag, publishes it to the SAME GitHub pre-release the macOS workflow targets
+# (both do create-if-missing with an identical notes body + upload their own asset with --clobber,
+# so whichever workflow wins the create race, the release ends up the same). workflow_dispatch
+# still works for a no-publish smoke build (uploads a 7-day CI artifact instead).
+#
+# UNSIGNED — no Authenticode cert, so SmartScreen shows "Windows protected your PC" on first run
+# (More info -> Run anyway). Code signing (e.g. Azure Trusted Signing) is a deferred operator step.
+# There is no STT helper build step: the live-transcription helper is a compiled
+# Swift/whisper.cpp binary (macOS-only), and tauri.windows.conf.json overrides bundle.resources to
+# [] so the Windows bundle neither needs nor ships it.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # required to create the release on a tag push
+
+jobs:
+  build:
+    runs-on: windows-latest # x64
+    defaults:
+      run:
+        working-directory: desktop
+        shell: bash # keep the scripts identical to the macOS workflow (Git Bash)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Tauri build (unsigned NSIS, x64)
+        # frontendDist is static (../src) with an empty beforeBuildCommand, so there's no frontend
+        # build step. tauri.windows.conf.json limits bundle.targets to ["nsis"] (no WiX MSI) and
+        # empties bundle.resources (the macOS-only ih-stt-helper would fail tauri-build validation).
+        run: bun run tauri build --target x86_64-pc-windows-msvc
+
+      - name: Locate NSIS installer
+        id: nsis
+        run: |
+          exe="$(ls src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe | head -1)"
+          [ -n "$exe" ] || { echo "no NSIS installer produced" >&2; exit 1; }
+          # path is relative to working-directory (desktop/); make it repo-relative for later steps
+          echo "path=desktop/$exe" >> "$GITHUB_OUTPUT"
+          echo "Built: $exe"
+
+      - name: Upload unsigned installer (workflow_dispatch smoke build)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: inferencehub-windows-x64-unsigned
+          path: desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish pre-release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # NOTE: notes body duplicated in build-macos.yml — keep in sync.
+          notes="$(cat <<'EOF'
+          Thin client of the hosted InferenceHub chat (`chat.inferencehub.tech`). Unsigned builds — expect an OS trust warning on first run.
+
+          ## macOS (Apple Silicon, ad-hoc signed, not notarized)
+
+          Drag **InferenceHub.app** out of the dmg into **/Applications**, then clear the quarantine flag:
+
+          ```
+          xattr -dr com.apple.quarantine /Applications/InferenceHub.app
+          ```
+
+          (or right-click → Open → Open Anyway on macOS 15+.) A fully signed + notarized build (no workaround) is still pending an Apple Developer cert.
+
+          ## Windows (x64, NSIS installer, unsigned)
+
+          Run **InferenceHub_<version>_x64-setup.exe**. SmartScreen will show "Windows protected your PC" — click **More info → Run anyway**. If the WebView2 Runtime is missing (rare), the installer downloads it automatically.
+
+          The Windows build is chat + sign-in + tray only (no live transcription / Stealth Mode / window opacity — those are macOS-only for now). A code-signed build (no SmartScreen warning) is pending an Authenticode / Azure Trusted Signing cert.
+          EOF
+          )"
+          # Both this and the macOS workflow run on the same tag: create-if-missing with an identical
+          # notes body (first one wins; `|| true` absorbs a lost create race), then upload our asset.
+          # --clobber makes re-runs idempotent.
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "InferenceHub Desktop $tag (unsigned)" \
+              --prerelease --notes "$notes" || true
+          fi
+          gh release upload "$tag" "${{ steps.nsis.outputs.path }}" --repo "$GITHUB_REPOSITORY" --clobber

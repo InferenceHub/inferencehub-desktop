@@ -1,0 +1,143 @@
+name: Build macOS (unsigned)
+
+# Builds the InferenceHub desktop app (a thin Tauri client of the hosted chat backend)
+# into an UNSIGNED Apple-Silicon .dmg, and — on a version tag — PUBLISHES it as a GitHub pre-release.
+#
+# This replaces the hand-built release flow: `git tag v0.2.3-unsigned && git push --tags` now builds AND
+# publishes the dmg automatically. `workflow_dispatch` still works for a no-publish smoke build (uploads a
+# 7-day CI artifact instead of cutting a release).
+#
+# UNSIGNED (ad-hoc only) — no Apple Developer ID cert / notarization / updater key (those are operator
+# secrets added at a real signed release). The build IS ad-hoc signed (tauri.conf
+# signingIdentity="-") so it launches, but it is NOT notarized, so Gatekeeper still quarantine-flags it →
+# users run the documented `xattr -dr com.apple.quarantine` step. AUTO_UPDATER_DISABLED=true because the
+# updater pubkey is still the upstream fork's (auto-update is non-functional until the operator regenerates
+# the keypair).
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # required to create the release on a tag push
+
+jobs:
+  build:
+    runs-on: macos-latest # Apple Silicon
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Cache whisper.cpp build
+        uses: actions/cache@v4
+        with:
+          path: desktop/src-tauri/helper/.whisper-build
+          key: whisper-v1.9.1-macos14-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build native STT helper (whisper.cpp + Swift)
+        # Live-transcription sidecar — see src-tauri/helper/build-helper.sh for the
+        # whisper.cpp static build, the embedded __info_plist TCC strings, and the
+        # helper's own hardened-runtime codesign (Tauri only signs the main binary).
+        run: ./src-tauri/helper/build-helper.sh
+
+      - name: Tauri build (ad-hoc signed, aarch64)
+        # No APPLE_* / TAURI_SIGNING_* env => NOT notarized, no updater .sig. But tauri.conf sets
+        # macOS.signingIdentity="-", so tauri runs `codesign -s -` (ad-hoc) over the bundle before
+        # packaging the dmg — producing a VALID ad-hoc signature. Without it the bundle carries only
+        # the linker's ad-hoc sig (no _CodeSignature/CodeResources), which Apple Silicon kills on a
+        # quarantined Finder launch ("quit unexpectedly" / SIGABRT in tao did_finish_launching).
+        # frontendDist is static (../src) with an empty beforeBuildCommand, so there's no frontend build step.
+        env:
+          AUTO_UPDATER_DISABLED: 'true'
+        run: bun run tauri build --target aarch64-apple-darwin
+
+      - name: Verify ad-hoc signature (fail the build if invalid)
+        # Guards the regression above: a bundle that fails --deep --strict would crash on launch,
+        # so refuse to publish it rather than ship a dead-on-arrival dmg.
+        run: |
+          app="$(ls -d src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app | head -1)"
+          [ -n "$app" ] || { echo "no .app produced" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          echo "ad-hoc signature valid: $app"
+
+      - name: Locate dmg
+        id: dmg
+        run: |
+          dmg="$(ls src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -1)"
+          [ -n "$dmg" ] || { echo "no dmg produced" >&2; exit 1; }
+          # path is relative to working-directory (desktop/); make it repo-relative for later steps
+          echo "path=desktop/$dmg" >> "$GITHUB_OUTPUT"
+          echo "Built: $dmg"
+
+      - name: Upload unsigned bundle (workflow_dispatch smoke build)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: inferencehub-macos-arm64-unsigned
+          path: |
+            desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish pre-release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # NOTE: notes body duplicated in build-windows.yml — keep in sync.
+          notes="$(cat <<'EOF'
+          Thin client of the hosted InferenceHub chat (`chat.inferencehub.tech`). Unsigned builds — expect an OS trust warning on first run.
+
+          ## macOS (Apple Silicon, ad-hoc signed, not notarized)
+
+          Drag **InferenceHub.app** out of the dmg into **/Applications**, then clear the quarantine flag:
+
+          ```
+          xattr -dr com.apple.quarantine /Applications/InferenceHub.app
+          ```
+
+          (or right-click → Open → Open Anyway on macOS 15+.) A fully signed + notarized build (no workaround) is still pending an Apple Developer cert.
+
+          ## Windows (x64, NSIS installer, unsigned)
+
+          Run **InferenceHub_<version>_x64-setup.exe**. SmartScreen will show "Windows protected your PC" — click **More info → Run anyway**. If the WebView2 Runtime is missing (rare), the installer downloads it automatically.
+
+          The Windows build is chat + sign-in + tray only (no live transcription / Stealth Mode / window opacity — those are macOS-only for now). A code-signed build (no SmartScreen warning) is pending an Authenticode / Azure Trusted Signing cert.
+          EOF
+          )"
+          # Both this and the Windows workflow run on the same tag: create-if-missing with an identical
+          # notes body (first one wins; `|| true` absorbs a lost create race), then upload our asset.
+          # --clobber makes re-runs idempotent.
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "InferenceHub Desktop $tag (unsigned)" \
+              --prerelease --notes "$notes" || true
+          fi
+          gh release upload "$tag" "${{ steps.dmg.outputs.path }}" --repo "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,35 @@
+[package]
+name = "inferencehub-desktop"
+version = "0.2.18"
+description = "Private, no-account desktop client for the InferenceHub gateway"
+authors = ["InferenceHub"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-window-state = "2.4.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+directories = "5.0"
+tokio = { version = "1", features = ["time"] }
+window-vibrancy = "0.7.1"
+url = "2.5"
+# reqwest removed: readiness probe uses std::net::TcpStream (no extra crate needed).
+# ureq (small, blocking, rustls) is ONLY for the plan-status poller (menubar budget) — fits the
+# std::thread::spawn background pattern with no async runtime plumbing.
+ureq = { version = "3", features = ["json"] }
+
+# macOS-only: set NSWindow alphaValue for the window-transparency setting (no cross-platform
+# Tauri opacity API exists). window.ns_window() is available because macos-private-api is on.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+devtools = ["tauri/devtools"]

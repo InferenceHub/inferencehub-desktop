@@ -1,0 +1,70 @@
+name: CI
+
+# Lean CI for the InferenceHub desktop app (a thin Tauri client of a hosted Onyx
+# instance — see deploy/onyx/). The only build artifact here is the Tauri shell, so
+# the gate is `cargo check` on desktop/src-tauri. Release bundling is in
+# build-macos.yml (workflow_dispatch), not a per-PR gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-check:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Cache whisper.cpp build
+        uses: actions/cache@v4
+        with:
+          path: desktop/src-tauri/helper/.whisper-build
+          key: whisper-v1.9.1-macos14-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build native STT helper (whisper.cpp + Swift)
+        # Tauri's build script validates `bundle.resources` paths during cargo check,
+        # so the helper must exist first. Doubles as a compile gate on the Swift source.
+        run: ./desktop/src-tauri/helper/build-helper.sh
+
+      - name: cargo check
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: cargo test
+        # Pure-helper unit tests (plan-status formatting/parsing) — no Tauri runtime needed.
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+  rust-check-windows:
+    # Compile gate for the cfg(not(macos)) paths + tauri-build config validation on Windows.
+    # No STT helper step: tauri.windows.conf.json overrides bundle.resources to [], so the
+    # macOS-only ih-stt-helper binary isn't required (or validated) on this target. Tests are
+    # skipped — the pure-helper tests already run on macOS above; this job is the compile gate.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: cargo check
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

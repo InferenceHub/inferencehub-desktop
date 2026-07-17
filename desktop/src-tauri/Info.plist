@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>InferenceHub uses the microphone to transcribe speech into your chat message.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>InferenceHub uses speech recognition to transcribe your voice into chat messages.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>InferenceHub captures system audio to transcribe your meetings.</string>
+</dict>
+</plist>

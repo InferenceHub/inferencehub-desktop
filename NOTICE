@@ -1,0 +1,16 @@
+InferenceHub Desktop
+Copyright 2026 InferenceHub
+
+This product includes software derived from the Onyx desktop client
+(https://github.com/onyx-dot-app/onyx), Copyright (c) 2023-present
+DanswerAI, Inc., used under the MIT License. See THIRD-PARTY-NOTICES.md
+for the full license text.
+
+The bundled live-transcription helper statically links whisper.cpp
+(https://github.com/ggml-org/whisper.cpp), Copyright (c) 2023-2024
+The ggml authors, used under the MIT License. See THIRD-PARTY-NOTICES.md.
+
+This project began as a fork of Jan (https://github.com/janhq/jan),
+Copyright 2025 Menlo Research, licensed under the Apache License,
+Version 2.0. The current application no longer ships Jan code; this
+credit records the project's heritage.

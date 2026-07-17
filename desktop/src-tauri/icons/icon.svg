@@ -1,0 +1,19 @@
+<svg viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <!-- macOS requires ~10% transparent padding around icons -->
+    <!-- Visible icon area: 819.2 x 819.2 (80% of 1024) centered with 102.4px margin on all sides -->
+
+    <!-- InferenceHub app icon: dark rounded tile + white "X" mark + solid lime spark.
+         Spark is a solid fill (not a gradient) so ImageMagick rasterizes it faithfully. -->
+    <rect x="102.4" y="102.4" width="819.2" height="819.2" rx="176" ry="176" fill="#0d0d0d"/>
+
+    <!-- "X" mark: the 64px artboard scaled 12.8x into the visible area (translate 102.4, scale 12.8). -->
+    <g transform="translate(102.4, 102.4) scale(12.8)">
+        <g fill="#ffffff">
+            <path d="M8 11 L24 11 L33.5 26.5 L27 29.5 Z"/>
+            <path d="M8 53 L24 53 L33.5 37.5 L27 34.5 Z"/>
+            <path d="M56 11 L40 11 L30.5 26.5 L37 29.5 Z"/>
+            <path d="M56 53 L40 53 L30.5 37.5 L37 34.5 Z"/>
+        </g>
+        <path d="M27 30.2 L36 32 L36 34 L27 32.2 Z" fill="#a6e22e"/>
+    </g>
+</svg>
