@@ -42,11 +42,12 @@ jobs:
         run: ./desktop/src-tauri/helper/build-helper.sh
 
       - name: cargo check
-        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+        # --locked: the committed Cargo.lock is authoritative; drift fails loudly (issue #3).
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
 
       - name: cargo test
         # Pure-helper unit tests (plan-status formatting/parsing) — no Tauri runtime needed.
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 
   rust-check-windows:
     # Compile gate for the cfg(not(macos)) paths + tauri-build config validation on Windows.
@@ -67,4 +68,4 @@ jobs:
           workspaces: desktop/src-tauri
 
       - name: cargo check
-        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
