@@ -1,0 +1,45 @@
+# Tells inferencehub-site the moment a desktop release is published as a FULL release.
+# The "released" activity type also fires when an existing pre-release is flipped to a
+# release — exactly the manual bless step — while CI's pre-release publishes never fire it.
+# The site's desktop-version-bump workflow then verifies the installer assets and opens
+# the version-bump PR.
+#
+# Needs the SITE_DISPATCH_TOKEN secret (fine-grained PAT for the site repo, Contents
+# read/write). Without it this is a warning no-op — the site's 6-hourly drift check
+# still catches up on its own.
+
+name: notify-site
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: repository_dispatch to inferencehub-site
+        env:
+          TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::warning::SITE_DISPATCH_TOKEN not set — skipping; the site's drift check picks this up within 6h."
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          if [ -z "${VERSION}" ]; then
+            # Manual test run: fall back to the latest full release.
+            VERSION="$(curl -fsS "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" | jq -r .tag_name)"
+            VERSION="${VERSION#v}"
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/InferenceHub/inferencehub-site/dispatches \
+            -d "{\"event_type\":\"desktop-release\",\"client_payload\":{\"version\":\"${VERSION}\"}}"
+          echo "dispatched desktop-release ${VERSION} to inferencehub-site"
