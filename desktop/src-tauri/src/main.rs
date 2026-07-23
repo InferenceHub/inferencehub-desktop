@@ -1110,7 +1110,7 @@ fn style_chat_window_builder(
         .user_agent(IH_WEBVIEW_USER_AGENT)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(14.0, 16.0));
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
     builder
 }
 
