@@ -1,0 +1,12 @@
+{
+  "identifier": "ih-remote-chat-drag",
+  "description": "The hosted chat page renders its own titlebar strip in place of the hidden native macOS title bar (chat repo deploy/web-ih/apply_desktop_shell.py). Grant that origin — and only it — the two core:window commands the strip needs: start_dragging (drag the window by the strip) and internal_toggle_maximize (double-click zoom). No other IPC is exposed to remote content.",
+  "remote": {
+    "urls": ["https://chat.inferencehub.tech/*"]
+  },
+  "windows": ["main", "ih-*"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize"
+  ]
+}

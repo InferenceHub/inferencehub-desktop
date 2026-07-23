@@ -80,6 +80,18 @@ const MENU_OPEN_DEBUG_LOG_ID: &str = "open_debug_log";
 /// (see deploy/onyx/) — this app is a thin client.
 const DEFAULT_SERVER_URL: &str = "https://chat.inferencehub.tech";
 
+/// Webview user agent: WKWebView's default plus a marker the hosted chat frontend keys its
+/// desktop-shell UI off (titlebar strip in place of the hidden native title bar, always-accordion
+/// sidebar — see the chat repo's deploy/web-ih/apply_desktop_shell.py). The web side matches on the
+/// "InferenceHubDesktop" token, so the version suffix is informational only. macOS-only, like the
+/// hidden-title-bar chrome it signals; Windows keeps its native decorated window and default UA.
+#[cfg(target_os = "macos")]
+const IH_WEBVIEW_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ",
+    "(KHTML, like Gecko) InferenceHubDesktop/",
+    env!("CARGO_PKG_VERSION")
+);
+
 /// InferenceHub GATEWAY origin (the account/billing app, distinct from the chat origin above). Used by the
 /// desktop SSO flow: the gateway mints a short-lived chat token after the user logs in. Override with
 /// IH_GATEWAY_URL. See spawn_desktop_sso / docs/ihsso in the inference-hub + inferencehub-chat repos.
@@ -1084,6 +1096,24 @@ fn trigger_new_chat(app: &AppHandle) {
     }
 }
 
+/// Shared chrome for hosted-chat windows built from Rust (the main window gets the same
+/// treatment from tauri.conf.json). On macOS the native title bar is hidden (Overlay +
+/// hidden title): the page's own titlebar strip — the chat repo's IhDesktopTitlebar
+/// overlay, activated by the user-agent marker — becomes the window chrome, and dragging
+/// runs through the start_dragging IPC granted in capabilities/ih-remote-chat.json.
+/// Other platforms keep the standard decorated window untouched.
+fn style_chat_window_builder(
+    builder: WebviewWindowBuilder<'_, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'_, tauri::Wry, AppHandle> {
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .user_agent(IH_WEBVIEW_USER_AGENT)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 16.0));
+    builder
+}
+
 fn trigger_new_window(app: &AppHandle) {
     let state = app.state::<AppState>();
     let base = state
@@ -1104,8 +1134,8 @@ fn trigger_new_window(app: &AppHandle) {
         .title("InferenceHub")
         .inner_size(1200.0, 800.0)
         .min_inner_size(800.0, 600.0);
+        let builder = style_chat_window_builder(builder);
 
-        // Standard decorated window (native, draggable title bar).
         if let Ok(window) = builder.build() {
             apply_settings_to_window(&handle, &window);
             maybe_open_devtools(&handle, &window);
@@ -1392,8 +1422,8 @@ async fn new_window(app: AppHandle, state: tauri::State<'_, AppState>) -> Result
     .title("InferenceHub")
     .inner_size(1200.0, 800.0)
     .min_inner_size(800.0, 600.0);
+    let builder = style_chat_window_builder(builder);
 
-    // Standard decorated window (native, draggable title bar).
     let window = builder.build().map_err(|e| e.to_string())?;
 
     apply_settings_to_window(&app, &window);
@@ -2181,6 +2211,12 @@ fn main() {
         })
         .on_page_load(|webview: &Webview, payload: &PageLoadPayload| {
             inject_chat_link_intercept(webview);
+
+            // Belt to the user-agent marker: lets the hosted chat frontend detect the
+            // desktop shell even if the UA is ever normalized away. macOS-only, matching
+            // the hidden-title-bar chrome it advertises.
+            #[cfg(target_os = "macos")]
+            let _ = webview.eval("window.__IH_DESKTOP__ = true;");
 
             if webview.label() == "main" {
                 // Advertise the native STT bridge to the chat page (feature detection —

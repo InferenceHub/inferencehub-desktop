@@ -1,6 +1,6 @@
 [package]
 name = "inferencehub-desktop"
-version = "0.2.18"
+version = "0.2.19"
 description = "Private, no-account desktop client for the InferenceHub gateway"
 authors = ["InferenceHub"]
 edition = "2021"
