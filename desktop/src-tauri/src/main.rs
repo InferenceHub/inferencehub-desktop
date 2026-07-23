@@ -80,6 +80,18 @@ const MENU_OPEN_DEBUG_LOG_ID: &str = "open_debug_log";
 /// (see deploy/onyx/) — this app is a thin client.
 const DEFAULT_SERVER_URL: &str = "https://chat.inferencehub.tech";
 
+/// Webview user agent: WKWebView's default plus a marker the hosted chat frontend keys its
+/// desktop-shell UI off (titlebar strip in place of the hidden native title bar, always-accordion
+/// sidebar — see the chat repo's deploy/web-ih/apply_desktop_shell.py). The web side matches on the
+/// "InferenceHubDesktop" token, so the version suffix is informational only. macOS-only, like the
+/// hidden-title-bar chrome it signals; Windows keeps its native decorated window and default UA.
+#[cfg(target_os = "macos")]
+const IH_WEBVIEW_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ",
+    "(KHTML, like Gecko) InferenceHubDesktop/",
+    env!("CARGO_PKG_VERSION")
+);
+
 /// InferenceHub GATEWAY origin (the account/billing app, distinct from the chat origin above). Used by the
 /// desktop SSO flow: the gateway mints a short-lived chat token after the user logs in. Override with
 /// IH_GATEWAY_URL. See spawn_desktop_sso / docs/ihsso in the inference-hub + inferencehub-chat repos.
@@ -1084,6 +1096,25 @@ fn trigger_new_chat(app: &AppHandle) {
     }
 }
 
+/// Shared chrome for hosted-chat windows built from Rust (the main window gets the same
+/// treatment from tauri.conf.json). On macOS the native title bar is hidden (Overlay +
+/// hidden title): the page's own titlebar strip — the chat repo's IhDesktopTitlebar
+/// overlay, activated by the user-agent marker — becomes the window chrome, and dragging
+/// is handled natively by install_drag_handle (Tauri v2 injects no IPC into remote
+/// origins, so the capability in capabilities/ih-remote-chat.json alone is inert — #6).
+/// Other platforms keep the standard decorated window untouched.
+fn style_chat_window_builder(
+    builder: WebviewWindowBuilder<'_, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'_, tauri::Wry, AppHandle> {
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .user_agent(IH_WEBVIEW_USER_AGENT)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
+    builder
+}
+
 fn trigger_new_window(app: &AppHandle) {
     let state = app.state::<AppState>();
     let base = state
@@ -1104,8 +1135,8 @@ fn trigger_new_window(app: &AppHandle) {
         .title("InferenceHub")
         .inner_size(1200.0, 800.0)
         .min_inner_size(800.0, 600.0);
+        let builder = style_chat_window_builder(builder);
 
-        // Standard decorated window (native, draggable title bar).
         if let Ok(window) = builder.build() {
             apply_settings_to_window(&handle, &window);
             maybe_open_devtools(&handle, &window);
@@ -1392,8 +1423,8 @@ async fn new_window(app: AppHandle, state: tauri::State<'_, AppState>) -> Result
     .title("InferenceHub")
     .inner_size(1200.0, 800.0)
     .min_inner_size(800.0, 600.0);
+    let builder = style_chat_window_builder(builder);
 
-    // Standard decorated window (native, draggable title bar).
     let window = builder.build().map_err(|e| e.to_string())?;
 
     apply_settings_to_window(&app, &window);
@@ -1480,6 +1511,10 @@ fn apply_settings_to_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     set_window_opacity(window, config.window_opacity);
     set_window_sharing(window, config.stealth_mode);
 
+    // Native drag handle for the hidden-title-bar chrome (idempotent).
+    #[cfg(target_os = "macos")]
+    install_drag_handle(window);
+
     // Menu-bar / decoration toggles are Windows/Linux only (macOS uses the native title bar
     // and has no in-window menu bar).
     if cfg!(target_os = "macos") {
@@ -1541,6 +1576,220 @@ fn set_window_sharing(window: &tauri::WebviewWindow, stealth: bool) {
     {
         let _ = (window, stealth);
     }
+}
+
+/// Install a transparent native drag-handle NSView over the titlebar strip of a chat window.
+///
+/// Tauri v2 never injects its IPC bridge (`__TAURI_INTERNALS__`) into remote-origin pages, so the
+/// web strip's `start_dragging` invoke is a silent no-op against the hosted chat (issue #6). This
+/// view needs no page cooperation: mouse-down starts an AppKit window drag
+/// (`NSWindow.performWindowDragWithEvent:`, public API since 10.11) and double-click zooms,
+/// matching native title-bar behavior. It floats above the webview but leaves the strip's left
+/// button cluster (traffic lights + sidebar toggle + New Session) uncovered so those clicks keep
+/// reaching the page — and it works on every page in the window, including /auth/login, where the
+/// web strip doesn't render.
+///
+/// Idempotent (skips when the handle is already a subview — on_page_load re-invokes it on every
+/// navigation) and main-thread-safe (all AppKit work runs via run_on_main_thread).
+#[cfg(target_os = "macos")]
+fn install_drag_handle(window: &tauri::WebviewWindow) {
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel, BOOL, YES};
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::sync::Once;
+
+    /// Height (logical px) of the page's titlebar strip (--ih-titlebar-h: 3.25rem).
+    const STRIP_HEIGHT: f64 = 52.0;
+    /// Left zone the handle leaves uncovered: traffic lights (~76px) + the strip's sidebar
+    /// toggle and New Session buttons (~152px worst case) with margin.
+    const EXCLUDED_LEFT: f64 = 170.0;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
+    unsafe impl objc::Encode for NSPoint {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+        }
+    }
+    unsafe impl objc::Encode for NSSize {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGSize=dd}") }
+        }
+    }
+    unsafe impl objc::Encode for NSRect {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+        }
+    }
+
+    extern "C" fn mouse_down(this: &Object, _sel: Sel, event: *mut Object) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // AppKit re-dispatches the mouse-down once a performWindowDragWithEvent session ends
+        // without movement (so plain clicks still reach the view) — without dedupe a double-click
+        // would performZoom twice (zoom + instant restore). The NSEvent timestamp is identical on
+        // the re-delivery and unique across real events.
+        static LAST_EVENT_TS_BITS: AtomicU64 = AtomicU64::new(0);
+        unsafe {
+            let ns_window: *mut Object = msg_send![this, window];
+            if ns_window.is_null() || event.is_null() {
+                return;
+            }
+            let ts: f64 = msg_send![event, timestamp];
+            if LAST_EVENT_TS_BITS.swap(ts.to_bits(), Ordering::SeqCst) == ts.to_bits() {
+                return; // same event re-delivered
+            }
+            let clicks: i64 = msg_send![event, clickCount];
+            if clicks == 2 {
+                zoom_toggle(ns_window);
+            } else {
+                let _: () = msg_send![ns_window, performWindowDragWithEvent: event];
+            }
+        }
+    }
+
+    /// Match the native title bar: dragging an unfocused window works on the first click.
+    extern "C" fn accepts_first_mouse(_this: &Object, _sel: Sel, _event: *mut Object) -> BOOL {
+        YES
+    }
+
+    /// Double-click zoom toggle. NSWindow's own `zoom:` reliably zooms but won't restore here
+    /// (its saved user frame gets clobbered under tao's window delegate), so toggle manually:
+    /// at the zoomed frame, restore the pre-zoom frame stashed on the window via an associated
+    /// object; anywhere else, stash the current frame and animate to the screen's visible frame.
+    unsafe fn zoom_toggle(ns_window: *mut Object) {
+        use objc::runtime::Object;
+        use objc::{class, msg_send, sel, sel_impl};
+        use std::ffi::c_void;
+
+        extern "C" {
+            fn objc_setAssociatedObject(
+                object: *mut Object,
+                key: *const c_void,
+                value: *mut Object,
+                policy: usize,
+            );
+            fn objc_getAssociatedObject(object: *mut Object, key: *const c_void) -> *mut Object;
+        }
+        const OBJC_ASSOCIATION_RETAIN_NONATOMIC: usize = 1;
+        static SAVED_FRAME_KEY: u8 = 0;
+        let key = &SAVED_FRAME_KEY as *const u8 as *const c_void;
+
+        let screen: *mut Object = msg_send![ns_window, screen];
+        let screen: *mut Object = if screen.is_null() {
+            msg_send![class!(NSScreen), mainScreen]
+        } else {
+            screen
+        };
+        if screen.is_null() {
+            return;
+        }
+        let vis: NSRect = msg_send![screen, visibleFrame];
+        let cur: NSRect = msg_send![ns_window, frame];
+        let at_zoomed = (cur.origin.x - vis.origin.x).abs() < 8.0
+            && (cur.origin.y - vis.origin.y).abs() < 8.0
+            && (cur.size.width - vis.size.width).abs() < 8.0
+            && (cur.size.height - vis.size.height).abs() < 8.0;
+
+        let saved: *mut Object = objc_getAssociatedObject(ns_window, key);
+        if at_zoomed && !saved.is_null() {
+            let frame: NSRect = msg_send![saved, rectValue];
+            let _: () = msg_send![ns_window, setFrame: frame display: YES animate: YES];
+        } else {
+            let val: *mut Object = msg_send![class!(NSValue), valueWithRect: cur];
+            objc_setAssociatedObject(ns_window, key, val, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            let _: () = msg_send![ns_window, setFrame: vis display: YES animate: YES];
+        }
+    }
+
+    fn handle_class() -> &'static Class {
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| {
+            let mut decl = ClassDecl::new("IHDragHandleView", class!(NSView))
+                .expect("IHDragHandleView class name is unique");
+            unsafe {
+                decl.add_method(
+                    sel!(mouseDown:),
+                    mouse_down as extern "C" fn(&Object, Sel, *mut Object),
+                );
+                decl.add_method(
+                    sel!(acceptsFirstMouse:),
+                    accepts_first_mouse as extern "C" fn(&Object, Sel, *mut Object) -> BOOL,
+                );
+            }
+            decl.register();
+        });
+        Class::get("IHDragHandleView").expect("registered above")
+    }
+
+    let win = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = win.ns_window() else {
+            eprintln!("[IH] drag handle: no ns_window");
+            return;
+        };
+        let class = handle_class();
+        unsafe {
+            let ns_window = ns_window as *mut Object;
+            let content_view: *mut Object = msg_send![ns_window, contentView];
+            if content_view.is_null() {
+                return;
+            }
+
+            let subviews: *mut Object = msg_send![content_view, subviews];
+            let count: usize = msg_send![subviews, count];
+            for i in 0..count {
+                let sub: *mut Object = msg_send![subviews, objectAtIndex: i];
+                let is_handle: BOOL = msg_send![sub, isKindOfClass: class];
+                if is_handle == YES {
+                    return; // already installed
+                }
+            }
+
+            // contentView spans the whole window (fullSizeContentView); AppKit coords are
+            // bottom-up, so the strip is the top STRIP_HEIGHT of the bounds.
+            let bounds: NSRect = msg_send![content_view, bounds];
+            let frame = NSRect {
+                origin: NSPoint {
+                    x: EXCLUDED_LEFT,
+                    y: bounds.size.height - STRIP_HEIGHT,
+                },
+                size: NSSize {
+                    width: (bounds.size.width - EXCLUDED_LEFT).max(0.0),
+                    height: STRIP_HEIGHT,
+                },
+            };
+            let view: *mut Object = msg_send![class, alloc];
+            let view: *mut Object = msg_send![view, initWithFrame: frame];
+            if view.is_null() {
+                return;
+            }
+            // Width tracks the window; the flexible bottom margin pins it to the top edge.
+            let mask: u64 = 2 | 8; // NSViewWidthSizable | NSViewMinYMargin
+            let _: () = msg_send![view, setAutoresizingMask: mask];
+            let _: () = msg_send![content_view, addSubview: view]; // appended last => above the webview
+            let _: () = msg_send![view, release]; // addSubview retains
+            eprintln!(
+                "[IH] drag handle installed: frame=({}, {}, {}, {})",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            );
+        }
+    });
 }
 
 fn handle_menu_bar_toggle(app: &AppHandle) {
@@ -2181,6 +2430,22 @@ fn main() {
         })
         .on_page_load(|webview: &Webview, payload: &PageLoadPayload| {
             inject_chat_link_intercept(webview);
+
+            // Belt to the user-agent marker: lets the hosted chat frontend detect the
+            // desktop shell even if the UA is ever normalized away. macOS-only, matching
+            // the hidden-title-bar chrome it advertises.
+            #[cfg(target_os = "macos")]
+            let _ = webview.eval("window.__IH_DESKTOP__ = true;");
+
+            // Belt for the native drag handle: re-assert on every page load (idempotent) in
+            // case the window was created before the first install could attach it.
+            #[cfg(target_os = "macos")]
+            {
+                let app = webview.app_handle();
+                if let Some(win) = app.get_webview_window(webview.label()) {
+                    install_drag_handle(&win);
+                }
+            }
 
             if webview.label() == "main" {
                 // Advertise the native STT bridge to the chat page (feature detection —
