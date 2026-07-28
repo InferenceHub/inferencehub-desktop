@@ -262,10 +262,58 @@ const MENU_KEY_HANDLER_SCRIPT: &str = r#"
 })();
 "#;
 
+// Console capture for IH_DEBUG. Transport is a batched, cancelled `ih-log.localhost`
+// navigation (the same no-IPC channel as the ih-sso login trigger and the ih-stt bridge):
+// the app's page is the REMOTE chat origin, where `invoke()` is unreachable — Tauri
+// firewalls IPC from remote URLs — so the previous invoke('log_from_frontend') transport
+// captured nothing there (desktop#8). Batches flush at most every 400ms, are capped in
+// size (URL-borne), and drop oldest-first under pressure: debug tooling, best-effort.
 const CONSOLE_CAPTURE_SCRIPT: &str = r#"
 (() => {
   if (window.__IH_CONSOLE_CAPTURE__) return;
   window.__IH_CONSOLE_CAPTURE__ = true;
+
+  // http(s) pages only: the local boot shell (tauri: origin) is a transient redirector
+  // with nothing worth capturing, and a sentinel navigation fired during its early,
+  // uncommitted load panics wry (Option::unwrap in the policy handler — seen live).
+  if (!/^https?:$/.test(location.protocol)) return;
+
+  const MAX_BATCH_CHARS = 6000;   // keep the sentinel URL comfortably short
+  const MAX_LINE_CHARS = 4000;
+  const MAX_QUEUE = 500;
+  const FLUSH_MS = 400;
+  const queue = [];
+  let scheduled = false;
+
+  function flush() {
+    scheduled = false;
+    if (!queue.length) return;
+    const batch = [];
+    let size = 0;
+    while (queue.length) {
+      const entry = queue[0];
+      size += entry[1].length + entry[0].length + 8;
+      if (batch.length && size > MAX_BATCH_CHARS) break;
+      batch.push(queue.shift());
+    }
+    try {
+      window.location.href =
+        'https://ih-log.localhost/b?d=' + encodeURIComponent(JSON.stringify(batch));
+    } catch {}
+    if (queue.length) schedule();
+  }
+
+  function schedule() {
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(flush, FLUSH_MS);
+  }
+
+  function send(level, message) {
+    queue.push([level, String(message).slice(0, MAX_LINE_CHARS)]);
+    if (queue.length > MAX_QUEUE) queue.splice(0, queue.length - MAX_QUEUE);
+    schedule();
+  }
 
   const levels = ['log', 'warn', 'error', 'info', 'debug'];
   const originals = {};
@@ -275,44 +323,33 @@ const CONSOLE_CAPTURE_SCRIPT: &str = r#"
     console[level] = function(...args) {
       originals[level].apply(console, args);
       try {
-        const invoke =
-          window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
-        if (typeof invoke === 'function') {
-          const message = args.map(a => {
-            try { return typeof a === 'string' ? a : JSON.stringify(a); }
-            catch { return String(a); }
-          }).join(' ');
-          invoke('log_from_frontend', { level, message });
-        }
+        send(level, args.map(a => {
+          try { return typeof a === 'string' ? a : JSON.stringify(a); }
+          catch { return String(a); }
+        }).join(' '));
       } catch {}
     };
   });
 
   window.addEventListener('error', (event) => {
     try {
-      const invoke =
-        window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
-      if (typeof invoke === 'function') {
-        invoke('log_from_frontend', {
-          level: 'error',
-          message: `[uncaught] ${event.message} at ${event.filename}:${event.lineno}:${event.colno}`
-        });
-      }
+      send('error', `[uncaught] ${event.message} at ${event.filename}:${event.lineno}:${event.colno}`);
     } catch {}
   });
 
   window.addEventListener('unhandledrejection', (event) => {
     try {
-      const invoke =
-        window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
-      if (typeof invoke === 'function') {
-        invoke('log_from_frontend', {
-          level: 'error',
-          message: `[unhandled rejection] ${event.reason}`
-        });
-      }
+      send('error', `[unhandled rejection] ${event.reason}`);
     } catch {}
   });
+
+  // One self-test line per install: proves the sentinel transport end-to-end shortly
+  // after the capture arms (an empty frontend_debug.log used to be indistinguishable
+  // from a dead transport — desktop#8). Delayed so the first flush never races the
+  // just-committed page load.
+  setTimeout(() => {
+    try { send('info', '[ih-console-capture] armed on ' + location.origin); } catch {}
+  }, 1500);
 })();
 "#;
 
@@ -1438,8 +1475,7 @@ async fn start_drag_window(window: tauri::Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn log_from_frontend(level: String, message: String, state: tauri::State<AppState>) {
+fn append_debug_log(state: &AppState, level: &str, message: &str) {
     if !state.debug_mode {
         return;
     }
@@ -1452,6 +1488,27 @@ fn log_from_frontend(level: String, message: String, state: tauri::State<AppStat
             let _ = file.flush();
         }
     }
+}
+
+/// `ih-log.localhost` sentinel payload: a JSON array of `[level, message]` pairs batched by
+/// CONSOLE_CAPTURE_SCRIPT. This is the remote-page path — `invoke` below only works from
+/// local (sidecar) origins.
+fn log_batch_from_page(app: &AppHandle, payload: &str) {
+    let state = app.state::<AppState>();
+    if !state.debug_mode {
+        return;
+    }
+    let Ok(entries) = serde_json::from_str::<Vec<(String, String)>>(payload) else {
+        return;
+    };
+    for (level, message) in entries {
+        append_debug_log(&state, &level, &message);
+    }
+}
+
+#[tauri::command]
+fn log_from_frontend(level: String, message: String, state: tauri::State<AppState>) {
+    append_debug_log(&state, &level, &message);
 }
 
 #[tauri::command]
@@ -2297,6 +2354,18 @@ fn main() {
                     // `webview.url()`, which panics inside wry during the initial uncommitted load).
                     if destination_url.host_str() == Some("ih-sso.localhost") {
                         spawn_desktop_sso(webview.app_handle().clone());
+                        return false;
+                    }
+                    // IH_DEBUG console capture from the (remote) chat page: `invoke` has no IPC
+                    // there, so CONSOLE_CAPTURE_SCRIPT ships batched log lines through this
+                    // cancelled-navigation sentinel instead (desktop#8).
+                    if destination_url.host_str() == Some("ih-log.localhost") {
+                        let app = webview.app_handle().clone();
+                        if let Some((_, payload)) =
+                            destination_url.query_pairs().find(|(k, _)| k == "d")
+                        {
+                            log_batch_from_page(&app, &payload);
+                        }
                         return false;
                     }
                     // Native STT bridge: the chat page's live-transcribe button starts/stops the
