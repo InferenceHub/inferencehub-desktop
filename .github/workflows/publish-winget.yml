@@ -1,0 +1,71 @@
+# Submits each blessed desktop release to the winget community repo
+# (microsoft/winget-pkgs) as a version-bump PR, so `winget install InferenceHub.InferenceHub`
+# tracks the latest release without anyone hand-editing three YAML manifests.
+#
+# Trigger is `released`, NOT `published`: CI publishes every v* tag as a PRE-release, and the
+# manual flip to a full release is the bless step. Same trigger notify-site.yml uses, so the
+# site bump and the winget submission fire off the same click.
+#
+# The action (Komac under the hood) reads the release's .exe asset, computes its sha256, copies
+# the previous version's manifests forward, and opens the PR from a fork. Upstream then runs its
+# own validation pipeline; a moderator approves version bumps, usually same-day.
+#
+# Needs the WINGET_TOKEN secret — a CLASSIC PAT with the `public_repo` scope, owned by the account
+# that holds the winget-pkgs fork (tianyiswufeng). Fine-grained PATs are NOT supported by the
+# action, and the default GITHUB_TOKEN cannot open cross-repository PRs. Without the secret this
+# workflow is a warning no-op, and the release can still be submitted by hand.
+
+name: publish-winget
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to submit (e.g. v0.2.19) — must be a published full release'
+        required: true
+        type: string
+
+# The winget-pkgs PR is authenticated with WINGET_TOKEN, but the action still uses the workflow
+# token to read this release's assets and to raise cargo-binstall's API rate limit, so it needs
+# read — `permissions: {}` (what notify-site.yml can afford) would starve those steps.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      # Mapped to env so the steps below can branch on its presence (the secrets context is not
+      # usable in a step-level `if`).
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Skip when no token is configured
+        if: env.WINGET_TOKEN == ''
+        run: |
+          echo "::warning::WINGET_TOKEN not set — skipping the winget submission for this release. Submit by hand, or add the secret to automate future releases."
+
+      - name: Submit version bump to microsoft/winget-pkgs
+        if: env.WINGET_TOKEN != ''
+        # Pinned to a commit rather than @main: this step receives a PAT that can push to our
+        # winget-pkgs fork, so unreviewed upstream changes should not run with it. Bump this SHA
+        # deliberately (main as of 2026-07-28). The v2 tag is 18 months stale — do not use it.
+        # Pinning is partial containment, not a guarantee: the action itself depends on
+        # cargo-bins/cargo-binstall@main and installs komac from crates.io at run time. Those run
+        # with the workflow token (read-only, above), not with WINGET_TOKEN.
+        uses: vedantmgoyal9/winget-releaser@b3a5dae0047c6180023acba3f548c55fdf6b7193
+        with:
+          identifier: InferenceHub.InferenceHub
+          # The fork lives on the maintainer's account, not under the InferenceHub org, so this
+          # cannot fall back to the action's `github.repository_owner` default.
+          fork-user: tianyiswufeng
+          # Releases carry a macOS .dmg alongside the Windows installer; take only the installer.
+          installers-regex: '\.exe$'
+          release-tag: ${{ github.event.release.tag_name || inputs.tag }}
+          # 0 = keep every version. Deliberately not pruning: any positive value makes the action
+          # auto-submit `komac remove` PRs that DELETE our older manifests from microsoft's repo
+          # once the count is exceeded — an unattended, outward-facing write to someone else's
+          # repository. Set a number here only if we decide that trade is worth it.
+          max-versions-to-keep: 0
+          token: ${{ secrets.WINGET_TOKEN }}
