@@ -96,6 +96,8 @@ jobs:
 
           (or right-click → Open → Open Anyway on macOS 15+.) A fully signed + notarized build (no workaround) is still pending an Apple Developer cert.
 
+          **Updating from an earlier version?** macOS silently drops the app's **Screen & System Audio Recording** approval on every update (unsigned builds can't keep it), even though System Settings still shows it allowed. If meeting-audio transcription complains: System Settings → Privacy & Security → Screen & System Audio Recording → switch InferenceHub **off and on**, then **quit and reopen** the app.
+
           ## Windows (x64, NSIS installer, unsigned)
 
           Run **InferenceHub_<version>_x64-setup.exe**. SmartScreen will show "Windows protected your PC" — click **More info → Run anyway**. If the WebView2 Runtime is missing (rare), the installer downloads it automatically.
