@@ -83,7 +83,10 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           # NOTE: notes body duplicated in build-macos.yml — keep in sync.
-          notes="$(cat <<'EOF'
+          # Notes go through a FILE, not $(cat <<heredoc): macOS runs /bin/bash 3.2, whose
+          # command-substitution parser quote-tracks heredoc CONTENT — one apostrophe in the
+          # notes derailed it (v0.2.20 first cut). --notes-file has no such landmine.
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
           Thin client of the hosted InferenceHub chat (`chat.inferencehub.tech`). Unsigned builds — expect an OS trust warning on first run.
 
           ## macOS (Apple Silicon, ad-hoc signed, not notarized)
@@ -104,13 +107,12 @@ jobs:
 
           The Windows build is chat + sign-in + tray only (no live transcription / Stealth Mode / window opacity — those are macOS-only for now). A code-signed build (no SmartScreen warning) is pending an Authenticode / Azure Trusted Signing cert.
           EOF
-          )"
           # Both this and the macOS workflow run on the same tag: create-if-missing with an identical
           # notes body (first one wins; `|| true` absorbs a lost create race), then upload our asset.
           # --clobber makes re-runs idempotent.
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
               --title "InferenceHub Desktop $tag (unsigned)" \
-              --prerelease --notes "$notes" || true
+              --prerelease --notes-file "$RUNNER_TEMP/release-notes.md" || true
           fi
           gh release upload "$tag" "${{ steps.nsis.outputs.path }}" --repo "$GITHUB_REPOSITORY" --clobber
