@@ -12,6 +12,9 @@
 //   {"type":"partial","text":"..."}         rolling hypothesis for the current utterance
 //   {"type":"final","text":"..."}           finalized utterance (silence or window cap)
 //   {"type":"error","message":"..."}        fatal — helper exits 1 afterwards
+//     (system-audio permission failures add "code":"screen-audio-permission"
+//      plus the raw macOS error in "detail", so the Rust shell can raise a
+//      native remediation dialog beyond the chat page's toast)
 //
 // Lifecycle: runs until SIGTERM/SIGINT (Rust kills it) or stdin closes
 // (parent died).
@@ -32,6 +35,23 @@ func emit(_ obj: [String: String]) {
 
 func fail(_ message: String) -> Never {
     emit(["type": "error", "message": message])
+    exit(1)
+}
+
+/// Screen & System Audio Recording permission failure, structured for the shell.
+/// The message must lead with the off→on + relaunch dance: the common trap is a
+/// grant that LOOKS active in System Settings but is dead — TCC pins the
+/// approval to the exact signed binary, so an app update silently invalidates
+/// it, and a grant made while the app is running only applies after a relaunch.
+func failScreenAudioPermission(detail: String) -> Never {
+    emit([
+        "type": "error",
+        "code": "screen-audio-permission",
+        "message": "System audio is blocked by macOS — open System Settings → Privacy & Security "
+            + "→ Screen & System Audio Recording, switch InferenceHub OFF then ON "
+            + "(add it if missing), then quit and reopen InferenceHub.",
+        "detail": detail,
+    ])
     exit(1)
 }
 
@@ -336,8 +356,20 @@ final class MicSource {
 }
 
 #if canImport(ScreenCaptureKit)
+import CoreGraphics
 import CoreMedia
 import ScreenCaptureKit
+
+/// True when the capture failure is macOS's TCC (permission) denial rather
+/// than a transient one. SCStream reports it as `.userDeclined` ("The user
+/// declined TCCs"); SCShareableContent sometimes surfaces the same denial as
+/// a plain NSError, so fall back to sniffing the description.
+func isScreenCapturePermissionDenial(_ error: Error) -> Bool {
+    if let sc = error as? SCStreamError {
+        return sc.code == .userDeclined
+    }
+    return (error as NSError).localizedDescription.localizedCaseInsensitiveContains("tcc")
+}
 
 /// System-wide audio via ScreenCaptureKit — hears the meeting even on
 /// headphones (any app: Zoom, Teams, browser). Requires the Screen & System
@@ -352,6 +384,16 @@ final class SystemAudioSource: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() {
         Task {
+            // Preflight TCC instead of letting SCStream fail opaquely. On a
+            // genuine first use, CGRequestScreenCaptureAccess makes macOS put
+            // up its own permission prompt and registers the app in the
+            // Settings pane; when an entry already exists (denied, or a stale
+            // grant from before an app update) it returns false silently and
+            // our guidance is the only signal the user gets.
+            if !CGPreflightScreenCaptureAccess() {
+                CGRequestScreenCaptureAccess()
+                failScreenAudioPermission(detail: "screen-capture preflight declined")
+            }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: true)
@@ -384,10 +426,10 @@ final class SystemAudioSource: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.stream = stream
                 emit(["type": "ready"])
             } catch {
-                fail(
-                    "System audio permission needed — allow InferenceHub under "
-                        + "System Settings → Privacy & Security → Screen & System Audio Recording "
-                        + "(\(error.localizedDescription))")
+                if isScreenCapturePermissionDenial(error) {
+                    failScreenAudioPermission(detail: error.localizedDescription)
+                }
+                fail("System audio capture failed: \(error.localizedDescription)")
             }
         }
     }
@@ -402,6 +444,11 @@ final class SystemAudioSource: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // Mid-session revocation (Settings toggle flipped, or macOS 15's
+        // periodic re-approval denied) arrives here, not in start().
+        if isScreenCapturePermissionDenial(error) {
+            failScreenAudioPermission(detail: error.localizedDescription)
+        }
         fail("System audio capture stopped: \(error.localizedDescription)")
     }
 }

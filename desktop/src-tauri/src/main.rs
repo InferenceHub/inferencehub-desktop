@@ -31,7 +31,7 @@ use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tauri::image::Image;
@@ -450,6 +450,14 @@ pub struct AppConfig {
     /// the privacy switch for screen-share (dollars visible on stream; same concern as Stealth Mode).
     #[serde(default = "default_show_menu_bar")]
     pub show_budget_in_tray: bool,
+
+    /// Set once system-audio transcription has actually captured on this install. Survives app
+    /// updates (config.json outlives the bundle), which is the point: a later TCC denial with
+    /// this set means a formerly-working grant went stale — an ad-hoc-signed update invalidates
+    /// the approval while System Settings keeps showing the toggle ON — so the shell can raise
+    /// repair guidance instead of leaving the user staring at an allowed-but-broken toggle.
+    #[serde(default)]
+    pub stt_system_audio_worked: bool,
 }
 
 fn default_show_menu_bar() -> bool {
@@ -471,6 +479,7 @@ impl Default for AppConfig {
             install_id: String::new(),
             status_token: String::new(),
             show_budget_in_tray: true,
+            stt_system_audio_worked: false,
         }
     }
 }
@@ -659,9 +668,13 @@ fn start_stt_helper(app: AppHandle, source: String) {
                     continue;
                 }
                 let evt_app = reader_app.clone();
+                let eval_line = line.clone();
                 let _ = reader_app.run_on_main_thread(move || {
-                    eval_stt_event(&evt_app, &line);
+                    eval_stt_event(&evt_app, &eval_line);
                 });
+                // After the page toast is queued: persist "system audio worked"
+                // and raise the native permission dialog when warranted.
+                handle_stt_line(&reader_app, &source, &line);
             }
         }
         // Helper exited (or stdout broke): clear state so a restart works. If
@@ -694,6 +707,109 @@ fn stop_stt_helper(app: &AppHandle) {
         let _ = child.wait();
     }
 }
+
+/// React natively to one helper event line (system-audio source only) before
+/// it reaches the page:
+/// - "ready": persist that capture worked on this install, so a later TCC
+///   denial is recognizable as a STALE grant (an app update invalidates the
+///   approval while System Settings keeps showing the toggle ON — TCC pins it
+///   to the exact signed binary, and ours is ad-hoc signed).
+/// - "screen-audio-permission" errors: raise a native dialog that deep-links
+///   into System Settings — the page's toast can't, and it truncates. On a
+///   fresh install the first failure is skipped: macOS is showing its own
+///   permission prompt at that moment.
+fn handle_stt_line(app: &AppHandle, source: &str, line: &str) {
+    if source != "system" {
+        return;
+    }
+    let Ok(evt) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    match evt.get("type").and_then(|t| t.as_str()) {
+        Some("ready") => {
+            let state = app.state::<AppState>();
+            let mut config = state.config.write().unwrap();
+            if !config.stt_system_audio_worked {
+                config.stt_system_audio_worked = true;
+                let _ = save_config(&config);
+            }
+        }
+        Some("error")
+            if evt.get("code").and_then(|c| c.as_str()) == Some("screen-audio-permission") =>
+        {
+            let state = app.state::<AppState>();
+            let worked_before = {
+                let config = state.config.read().unwrap();
+                config.stt_system_audio_worked
+            };
+            let failures = state.stt_perm_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            if worked_before || failures >= 2 {
+                show_screen_audio_permission_dialog(app, worked_before);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Native remediation dialog for a Screen & System Audio Recording denial, with
+/// a button that deep-links straight into the Settings pane (the chat page has
+/// no shell access). `worked_before` picks the copy: a formerly-working install
+/// needs the off→on repair dance (the update invalidated the grant), a fresh
+/// one just needs the permission turned on. Both need the relaunch — a grant
+/// only applies to app processes started after it.
+#[cfg(target_os = "macos")]
+fn show_screen_audio_permission_dialog(app: &AppHandle, worked_before: bool) {
+    let _ = app.run_on_main_thread(move || {
+        use objc::runtime::Object;
+        use objc::{class, msg_send, sel, sel_impl};
+
+        unsafe fn nsstring(s: &str) -> *mut Object {
+            // Our strings are literals without interior NULs; stringWithUTF8String copies.
+            let c = std::ffi::CString::new(s).unwrap();
+            let ns: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+            ns
+        }
+
+        let (title, body) = if worked_before {
+            (
+                "System audio permission needs a reset",
+                "macOS dropped InferenceHub's Screen & System Audio Recording approval — \
+                 updating the app invalidates it, even though System Settings still shows \
+                 the toggle ON.\n\n\
+                 1. Open System Settings → Privacy & Security → Screen & System Audio Recording.\n\
+                 2. Switch InferenceHub OFF, then back ON.\n\
+                 3. Quit and reopen InferenceHub, then start Meeting audio again.",
+            )
+        } else {
+            (
+                "System audio permission needed",
+                "Transcribing meeting audio needs macOS's Screen & System Audio Recording \
+                 permission for InferenceHub.\n\n\
+                 1. Open System Settings → Privacy & Security → Screen & System Audio Recording.\n\
+                 2. Switch InferenceHub ON (add it with + if it isn't listed).\n\
+                 3. Quit and reopen InferenceHub, then start Meeting audio again.",
+            )
+        };
+        unsafe {
+            let alert: *mut Object = msg_send![class!(NSAlert), new];
+            let _: () = msg_send![alert, setMessageText: nsstring(title)];
+            let _: () = msg_send![alert, setInformativeText: nsstring(body)];
+            let _: *mut Object =
+                msg_send![alert, addButtonWithTitle: nsstring("Open System Settings")];
+            let _: *mut Object = msg_send![alert, addButtonWithTitle: nsstring("Not Now")];
+            // NSAlertFirstButtonReturn == 1000 (the first button added).
+            let response: isize = msg_send![alert, runModal];
+            if response == 1000 {
+                let _ = Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                    .spawn();
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_screen_audio_permission_dialog(_app: &AppHandle, _worked_before: bool) {}
 
 // ============================================================================
 // Sidecar state
@@ -1103,6 +1219,9 @@ struct AppState {
     sso_in_progress: AtomicBool,
     /// Running native STT helper (see spawn_stt_helper), killed on stop/reload.
     stt_child: Mutex<Option<Child>>,
+    /// System-audio permission failures this app run. The native remediation dialog is
+    /// suppressed on a fresh install's FIRST failure (macOS is showing its own prompt then).
+    stt_perm_failures: AtomicU32,
     /// Last successful plan-status poll (menubar budget) — read by the tray toggle for an instant
     /// title restore without waiting for the next poll.
     latest_plan_status: Mutex<Option<PlanStatus>>,
@@ -2401,6 +2520,7 @@ fn main() {
             install_id,
             sso_in_progress: AtomicBool::new(false),
             stt_child: Mutex::new(None),
+            stt_perm_failures: AtomicU32::new(0),
             latest_plan_status: Mutex::new(None),
             plan_poll_now: AtomicBool::new(false),
         })

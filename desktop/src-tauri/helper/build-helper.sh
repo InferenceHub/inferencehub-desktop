@@ -58,7 +58,7 @@ swiftc -O "$HERE/stt-helper.swift" \
     $LIB_FLAGS $LIBS -lc++ \
     -framework Metal -framework MetalKit -framework Accelerate \
     -framework AVFoundation -framework Foundation -framework CoreAudio \
-    -framework ScreenCaptureKit -framework CoreMedia \
+    -framework ScreenCaptureKit -framework CoreMedia -framework CoreGraphics \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
     -Xlinker "$HERE/helper-Info.plist" \
     -o "$OUT"
