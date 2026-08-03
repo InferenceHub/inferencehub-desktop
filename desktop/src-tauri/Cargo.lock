@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "inferencehub-desktop"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "directories",
  "objc",

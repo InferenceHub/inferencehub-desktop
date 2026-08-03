@@ -751,14 +751,28 @@ fn handle_stt_line(app: &AppHandle, source: &str, line: &str) {
     }
 }
 
-/// Native remediation dialog for a Screen & System Audio Recording denial, with
-/// a button that deep-links straight into the Settings pane (the chat page has
-/// no shell access). `worked_before` picks the copy: a formerly-working install
-/// needs the off→on repair dance (the update invalidated the grant), a fresh
-/// one just needs the permission turned on. Both need the relaunch — a grant
-/// only applies to app processes started after it.
+/// macOS asks for the Screen & System Audio Recording permission again after
+/// its TCC record for the app is cleared. Returns the current authorization.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// Native remediation dialog for a Screen & System Audio Recording denial.
+///
+/// The primary action is **Reset Permission**: clear the app's own TCC record
+/// (`tccutil reset ScreenCapture <bundle id>`) and immediately re-request, so
+/// macOS puts up a fresh prompt. This is load-bearing, not a convenience:
+/// every ad-hoc-signed update leaves behind a TCC row pinned to the old
+/// binary (a live repro found FIVE stacked rows), and the Settings toggle
+/// only flips the visible one — flipping it off/on does NOT unstick the
+/// lookup, only removing the rows does. `worked_before` merely picks the
+/// explanatory copy; the buttons are the same because a fresh-looking install
+/// can still carry stale rows from before the marker existed.
 #[cfg(target_os = "macos")]
 fn show_screen_audio_permission_dialog(app: &AppHandle, worked_before: bool) {
+    let bundle_id = app.config().identifier.clone();
     let _ = app.run_on_main_thread(move || {
         use objc::runtime::Object;
         use objc::{class, msg_send, sel, sel_impl};
@@ -774,10 +788,11 @@ fn show_screen_audio_permission_dialog(app: &AppHandle, worked_before: bool) {
             (
                 "System audio permission needs a reset",
                 "macOS dropped InferenceHub's Screen & System Audio Recording approval — \
-                 updating the app invalidates it, even though System Settings still shows \
-                 the toggle ON.\n\n\
-                 1. Open System Settings → Privacy & Security → Screen & System Audio Recording.\n\
-                 2. Switch InferenceHub OFF, then back ON.\n\
+                 updating the app invalidates it, even though System Settings may still \
+                 show the toggle ON.\n\n\
+                 1. Click Reset Permission below — it clears the broken approval and asks \
+                 macOS again.\n\
+                 2. Allow InferenceHub in the macOS prompt (or the Settings pane it opens).\n\
                  3. Quit and reopen InferenceHub, then start Meeting audio again.",
             )
         } else {
@@ -785,8 +800,8 @@ fn show_screen_audio_permission_dialog(app: &AppHandle, worked_before: bool) {
                 "System audio permission needed",
                 "Transcribing meeting audio needs macOS's Screen & System Audio Recording \
                  permission for InferenceHub.\n\n\
-                 1. Open System Settings → Privacy & Security → Screen & System Audio Recording.\n\
-                 2. Switch InferenceHub ON (add it with + if it isn't listed).\n\
+                 1. Click Reset Permission below — it asks macOS for the permission.\n\
+                 2. Allow InferenceHub in the macOS prompt (or the Settings pane it opens).\n\
                  3. Quit and reopen InferenceHub, then start Meeting audio again.",
             )
         };
@@ -794,12 +809,21 @@ fn show_screen_audio_permission_dialog(app: &AppHandle, worked_before: bool) {
             let alert: *mut Object = msg_send![class!(NSAlert), new];
             let _: () = msg_send![alert, setMessageText: nsstring(title)];
             let _: () = msg_send![alert, setInformativeText: nsstring(body)];
+            let _: *mut Object = msg_send![alert, addButtonWithTitle: nsstring("Reset Permission")];
             let _: *mut Object =
                 msg_send![alert, addButtonWithTitle: nsstring("Open System Settings")];
             let _: *mut Object = msg_send![alert, addButtonWithTitle: nsstring("Not Now")];
-            // NSAlertFirstButtonReturn == 1000 (the first button added).
+            // NSAlertFirstButtonReturn == 1000, then 1001/1002 in add order.
             let response: isize = msg_send![alert, runModal];
             if response == 1000 {
+                // Clear ONLY our own entry. "No such bundle identifier" (nothing
+                // to reset) is fine — the re-request below still fires the prompt.
+                let _ = Command::new("/usr/bin/tccutil")
+                    .args(["reset", "ScreenCapture", &bundle_id])
+                    .output();
+                let granted = CGRequestScreenCaptureAccess();
+                eprintln!("[IH] STT: TCC reset for {bundle_id}, re-request → granted={granted}");
+            } else if response == 1001 {
                 let _ = Command::new("open")
                     .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
                     .spawn();
