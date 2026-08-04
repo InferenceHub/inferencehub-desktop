@@ -68,8 +68,18 @@ const MENU_ALWAYS_ON_TOP_ID: &str = "always_on_top";
 /// macOS-only (NSWindow sharingType) — the menu item is not built on other platforms.
 #[cfg(target_os = "macos")]
 const MENU_STEALTH_MODE_ID: &str = "stealth_mode";
+/// Click Through (overlay): the window ignores every mouse event, so clicks land on whatever
+/// sits underneath — pair with Always on Top + a lowered Opacity for a meeting overlay.
+/// Deliberately NOT persisted: a relaunch into a window that ignores clicks reads as "app
+/// broken", so every launch starts clickable. macOS-only like the other overlay controls.
+#[cfg(target_os = "macos")]
+const MENU_CLICK_THROUGH_ID: &str = "click_through";
 /// Opacity presets (percent) shown under Window > Opacity. Item ids are `opacity_<pct>`.
 const OPACITY_PRESETS: &[u8] = &[100, 90, 80, 70, 60, 50];
+/// Opacity change per Ctrl+Shift+ArrowUp/Down press (percent). Steps stay on the preset grid
+/// (50..=100 in tens) so the Window > Opacity radio marks track the hotkey exactly.
+#[cfg(target_os = "macos")]
+const OPACITY_HOTKEY_STEP: i16 = 10;
 #[cfg(target_os = "linux")]
 const MENU_HIDE_DECORATIONS_ID: &str = "hide_window_decorations";
 const MENU_TOGGLE_DEVTOOLS_ID: &str = "toggle_devtools";
@@ -404,6 +414,41 @@ const IH_LOGIN_OVERLAY_SCRIPT: &str = r##"
   build();
 })();
 "##;
+
+/// Ctrl+T (global hotkey): toggle "Meeting audio" live transcription by driving the chat
+/// page's own LiveTranscribeButton, so the entire existing pipeline is reused — the page
+/// installs the `__ihStt` event sink, fires the `ih-stt.localhost` sentinel, wires the
+/// transcript into the composer, and raises its own toasts. Selectors are the overlay's
+/// stable aria-labels; the "Meeting audio" popover item mounts async, hence the short poll.
+/// A listening session stops with one click; while loading, the same click stops it and no
+/// picker appears (the poll just times out). Pages without the composer: no button, no-op.
+#[cfg(target_os = "macos")]
+const STT_HOTKEY_TOGGLE_SCRIPT: &str = r#"
+(() => {
+  const stop = document.querySelector('button[aria-label="Stop live transcription"]');
+  if (stop) { stop.click(); return; }
+  if (window.__ihSttHotkeyPending) return;
+  const start = document.querySelector('button[aria-label="Start live transcription"]');
+  if (!start) return;
+  window.__ihSttHotkeyPending = true;
+  start.click();
+  const deadline = Date.now() + 1500;
+  const timer = setInterval(() => {
+    for (const el of document.querySelectorAll('div,span,button,p')) {
+      if (el.childElementCount === 0 && el.textContent.trim() === 'Meeting audio') {
+        clearInterval(timer);
+        window.__ihSttHotkeyPending = false;
+        el.click();
+        return;
+      }
+    }
+    if (Date.now() > deadline) {
+      clearInterval(timer);
+      window.__ihSttHotkeyPending = false;
+    }
+  }, 50);
+})();
+"#;
 
 // ============================================================================
 // App config (window/menu preferences only — no server URL)
@@ -1251,6 +1296,9 @@ struct AppState {
     latest_plan_status: Mutex<Option<PlanStatus>>,
     /// Set to make the budget poller skip the remainder of its sleep (SSO success, tray toggle).
     plan_poll_now: AtomicBool,
+    /// Click Through mode — session-only by design (see MENU_CLICK_THROUGH_ID). All windows follow it.
+    #[cfg(target_os = "macos")]
+    click_through: AtomicBool,
 }
 
 // ============================================================================
@@ -1711,6 +1759,13 @@ fn apply_settings_to_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     set_window_opacity(window, config.window_opacity);
     set_window_sharing(window, config.stealth_mode);
 
+    // Click Through is session state, not config — still applied here so a window spawned
+    // while the mode is on behaves like the rest (the toggle itself hits every open window).
+    #[cfg(target_os = "macos")]
+    if state.click_through.load(Ordering::SeqCst) {
+        let _ = window.set_ignore_cursor_events(true);
+    }
+
     // Native drag handle for the hidden-title-bar chrome (idempotent).
     #[cfg(target_os = "macos")]
     install_drag_handle(window);
@@ -2045,6 +2100,51 @@ fn handle_stealth_toggle(app: &AppHandle) {
     }
 }
 
+/// Toggle Click Through: every window starts/stops ignoring mouse events (clicks fall through
+/// to whatever is underneath). Session-only — never saved. Reached from the Window-menu check
+/// item and the Ctrl+Shift+Z global hotkey; the hotkey is registered system-wide precisely
+/// because the mode makes the window impossible to re-focus with the mouse.
+#[cfg(target_os = "macos")]
+fn handle_click_through_toggle(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let on = !state.click_through.fetch_xor(true, Ordering::SeqCst);
+    for (_, window) in app.webview_windows() {
+        let _ = window.set_ignore_cursor_events(on);
+    }
+    if let Some(check) = find_check_menu_item(app, MENU_CLICK_THROUGH_ID) {
+        let _ = check.set_checked(on);
+    }
+    eprintln!("[IH] click-through: {}", if on { "on" } else { "off" });
+}
+
+/// Step window opacity by `delta` percent (Ctrl+Shift+ArrowUp/Down). Funnels into the preset
+/// handler so persistence and the Window > Opacity radio marks stay in sync; clamped to the
+/// same 50..=100 domain as the presets (the window never fades out entirely).
+#[cfg(target_os = "macos")]
+fn handle_step_opacity(app: &AppHandle, delta: i16) {
+    let current = {
+        let state = app.state::<AppState>();
+        let g = state.config.read().unwrap();
+        g.window_opacity as i16
+    };
+    let next = (current + delta).clamp(50, 100) as u8;
+    eprintln!("[IH] opacity hotkey: {} -> {}", current, next);
+    if next != current as u8 {
+        handle_set_opacity(app, next);
+    }
+}
+
+/// Ctrl+T: toggle "Meeting audio" live transcription from anywhere — mid-meeting the focused
+/// app is the meeting, not us, so this rides the global hotkey. The work happens in the page
+/// (see STT_HOTKEY_TOGGLE_SCRIPT); only the main window carries the STT bridge.
+#[cfg(target_os = "macos")]
+fn handle_stt_hotkey_toggle(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        eprintln!("[IH] stt hotkey: toggle dispatched to page");
+        let _ = window.eval(STT_HOTKEY_TOGGLE_SCRIPT);
+    }
+}
+
 fn handle_set_opacity(app: &AppHandle, pct: u8) {
     let state = app.state::<AppState>();
     {
@@ -2213,6 +2313,20 @@ fn setup_app_menu(app: &AppHandle) -> tauri::Result<()> {
             Some("CmdOrCtrl+."),
         )?;
 
+        // Session-only, so it always starts unchecked. The accelerator here is display +
+        // focused-fallback: the same combo is registered as a SYSTEM-WIDE hotkey in setup
+        // (which consumes the key before menu dispatch), so the mode can be left again
+        // while the window ignores the mouse or another app has focus.
+        #[cfg(target_os = "macos")]
+        let click_through_item = CheckMenuItem::with_id(
+            app,
+            MENU_CLICK_THROUGH_ID,
+            "Click Through",
+            true,
+            false,
+            Some("Ctrl+Shift+Z"),
+        )?;
+
         if let Some(window_menu) = menu
             .items()?
             .into_iter()
@@ -2224,6 +2338,7 @@ fn setup_app_menu(app: &AppHandle) -> tauri::Result<()> {
             #[cfg(target_os = "macos")]
             {
                 window_menu.append(&stealth_mode_item)?;
+                window_menu.append(&click_through_item)?;
 
                 let mut opacity_builder = SubmenuBuilder::new(app, "Opacity");
                 for preset in OPACITY_PRESETS {
@@ -2485,7 +2600,7 @@ fn main() {
         None
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(
             tauri::plugin::Builder::<Wry>::new("chat-external-navigation-handler")
@@ -2535,7 +2650,41 @@ fn main() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build());
+
+    // Overlay hotkeys (macOS, SYSTEM-WIDE): Ctrl+Shift+Z click-through, Ctrl+Shift+Arrow
+    // opacity steps, Ctrl+T meeting-audio transcription. Global rather than menu
+    // accelerators because they must fire while the meeting app has focus — and
+    // click-through mode makes this window unfocusable by mouse, so an in-app key could
+    // never turn the mode back off. Handler runs off the registrations made in setup.
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(|app, shortcut, event| {
+                use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
+                if event.state() != ShortcutState::Pressed {
+                    return;
+                }
+                // Window/menu/NSWindow work belongs on the main thread; hop defensively.
+                let dispatch = |task: fn(&AppHandle)| {
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || task(&handle));
+                };
+                let cs = Modifiers::CONTROL | Modifiers::SHIFT;
+                if shortcut.matches(cs, Code::KeyZ) {
+                    dispatch(handle_click_through_toggle);
+                } else if shortcut.matches(cs, Code::ArrowDown) {
+                    dispatch(|app| handle_step_opacity(app, -OPACITY_HOTKEY_STEP));
+                } else if shortcut.matches(cs, Code::ArrowUp) {
+                    dispatch(|app| handle_step_opacity(app, OPACITY_HOTKEY_STEP));
+                } else if shortcut.matches(Modifiers::CONTROL, Code::KeyT) {
+                    dispatch(handle_stt_hotkey_toggle);
+                }
+            })
+            .build(),
+    );
+
+    builder
         .manage(AppState {
             config: RwLock::new(config),
             server_base_url: RwLock::new(None),
@@ -2547,6 +2696,8 @@ fn main() {
             stt_perm_failures: AtomicU32::new(0),
             latest_plan_status: Mutex::new(None),
             plan_poll_now: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            click_through: AtomicBool::new(false),
         })
         .manage(SidecarState::new())
         .invoke_handler(tauri::generate_handler![
@@ -2570,6 +2721,8 @@ fn main() {
             MENU_ALWAYS_ON_TOP_ID => handle_always_on_top_toggle(app),
             #[cfg(target_os = "macos")]
             MENU_STEALTH_MODE_ID => handle_stealth_toggle(app),
+            #[cfg(target_os = "macos")]
+            MENU_CLICK_THROUGH_ID => handle_click_through_toggle(app),
             id if id.starts_with("opacity_") => {
                 if let Ok(pct) = id["opacity_".len()..].parse::<u8>() {
                     handle_set_opacity(app, pct);
@@ -2590,6 +2743,25 @@ fn main() {
 
             if let Err(e) = setup_tray_icon(&app_handle) {
                 eprintln!("Failed to setup tray icon: {}", e);
+            }
+
+            // Register the overlay hotkeys system-wide (handler lives on the plugin above).
+            // Non-fatal: a failed registration (combo held elsewhere) costs that hotkey —
+            // never the launch. Menu paths remain as fallbacks.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+                let cs = Modifiers::CONTROL | Modifiers::SHIFT;
+                for sc in [
+                    Shortcut::new(Some(cs), Code::KeyZ),
+                    Shortcut::new(Some(cs), Code::ArrowDown),
+                    Shortcut::new(Some(cs), Code::ArrowUp),
+                    Shortcut::new(Some(Modifiers::CONTROL), Code::KeyT),
+                ] {
+                    if let Err(e) = app_handle.global_shortcut().register(sc) {
+                        eprintln!("[IH] hotkey: could not register {:?}: {}", sc, e);
+                    }
+                }
             }
 
             // Standard decorated window (native, draggable title bar). No vibrancy/

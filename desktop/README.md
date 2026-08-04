@@ -30,8 +30,8 @@ bun install
 bun run tauri dev
 ```
 
-macOS-only features (live transcription, Stealth Mode, opacity, menu-bar budget title) are
-`cfg`-gated; the shell builds and runs on Windows without them.
+macOS-only features (live transcription, Stealth Mode, opacity, global overlay hotkeys,
+menu-bar budget title) are `cfg`-gated; the shell builds and runs on Windows without them.
 
 ## Live-transcription helper (macOS)
 
