@@ -1,6 +1,6 @@
 [package]
 name = "inferencehub-desktop"
-version = "0.2.21"
+version = "0.2.22"
 description = "Private, no-account desktop client for the InferenceHub gateway"
 authors = ["InferenceHub"]
 edition = "2021"
@@ -26,8 +26,11 @@ ureq = { version = "3", features = ["json"] }
 
 # macOS-only: set NSWindow alphaValue for the window-transparency setting (no cross-platform
 # Tauri opacity API exists). window.ns_window() is available because macos-private-api is on.
+# global-shortcut backs the system-wide overlay hotkeys (click-through / opacity / meeting
+# transcription) — macOS-only alongside the features it drives.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+tauri-plugin-global-shortcut = "2"
 
 [features]
 default = ["custom-protocol"]

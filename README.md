@@ -50,6 +50,7 @@ xattr -dr com.apple.quarantine /Applications/InferenceHub.app
 | Live transcription (on-device whisper.cpp) | ✅ | — |
 | Stealth Mode (hide window from screen shares, ⌘.) | ✅ | — |
 | Window opacity / always-on-top | ✅ | AoT only |
+| System-wide overlay hotkeys (⌃⇧Z click-through, ⌃⇧↑/↓ opacity, ⌃T meeting transcription) | ✅ | — |
 
 ## Build from source
 

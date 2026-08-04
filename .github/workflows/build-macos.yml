@@ -128,13 +128,15 @@ jobs:
 
           (or right-click → Open → Open Anyway on macOS 15+.) A fully signed + notarized build (no workaround) is still pending an Apple Developer cert.
 
+          System-wide shortcuts (they work while another app has focus): **Ctrl+Shift+Z** toggles click-through (clicks pass to the window underneath), **Ctrl+Shift+↑ / ↓** raise/lower window opacity, **Ctrl+T** starts/stops meeting-audio transcription.
+
           **Updating from an earlier version?** macOS silently drops the app's **Screen & System Audio Recording** approval on every update (unsigned builds can't keep it), even though System Settings still shows it allowed. If meeting-audio transcription complains: System Settings → Privacy & Security → Screen & System Audio Recording → switch InferenceHub **off and on**, then **quit and reopen** the app.
 
           ## Windows (x64, NSIS installer, unsigned)
 
           Run **InferenceHub_<version>_x64-setup.exe**. SmartScreen will show "Windows protected your PC" — click **More info → Run anyway**. If the WebView2 Runtime is missing (rare), the installer downloads it automatically.
 
-          The Windows build is chat + sign-in + tray only (no live transcription / Stealth Mode / window opacity — those are macOS-only for now). A code-signed build (no SmartScreen warning) is pending an Authenticode / Azure Trusted Signing cert.
+          The Windows build is chat + sign-in + tray only (no live transcription / Stealth Mode / window opacity / overlay hotkeys — those are macOS-only for now). A code-signed build (no SmartScreen warning) is pending an Authenticode / Azure Trusted Signing cert.
           EOF
           # Both this and the Windows workflow run on the same tag: create-if-missing with an identical
           # notes body (first one wins; `|| true` absorbs a lost create race), then upload our asset.
