@@ -44,7 +44,8 @@ use tauri::tray::TrayIconBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::Wry;
 use tauri::{
-    webview::PageLoadPayload, AppHandle, Manager, Webview, WebviewUrl, WebviewWindowBuilder,
+    webview::DownloadEvent, webview::PageLoadPayload, AppHandle, Manager, Webview, WebviewUrl,
+    WebviewWindowBuilder,
 };
 use url::Url;
 #[cfg(target_os = "macos")]
@@ -1324,6 +1325,76 @@ fn trigger_new_chat(app: &AppHandle) {
     }
 }
 
+/// Downloads from the hosted chat page ("Export as Markdown", "Export All Chats" .zip,
+/// attachment downloads). wry CANCELS every `<a download>` navigation unless the webview was
+/// built with a download handler — so without this, those clicks were a silent no-op in the
+/// desktop app (desktop#17). wry already picks `~/Downloads/<suggested name>` and de-dupes
+/// with ` (n)` suffixes, so `Requested` only has to accept. macOS never reports the saved
+/// path on `Finished` (API limitation), so the destination is remembered per URL from
+/// `Requested` and revealed in the file manager when the download succeeds.
+///
+/// Cross-repo contract: the page feature-detects this handler via `window.__IH_DOWNLOADS__`
+/// (set in on_page_load below) — older shells get a clipboard/hint fallback instead of silence.
+fn ih_download_handler(_webview: Webview, event: DownloadEvent<'_>) -> bool {
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            eprintln!("[IH] download requested -> {}", destination.display());
+            ih_pending_downloads()
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), destination.clone());
+            true
+        }
+        DownloadEvent::Finished { url, path, success } => {
+            let remembered = ih_pending_downloads().lock().unwrap().remove(url.as_str());
+            let saved = path.or(remembered);
+            match (success, saved) {
+                (true, Some(p)) => {
+                    eprintln!("[IH] download finished -> {}", p.display());
+                    reveal_in_file_manager(&p);
+                }
+                (true, None) => eprintln!("[IH] download finished (path unknown)"),
+                (false, p) => eprintln!(
+                    "[IH] download FAILED{}",
+                    p.map(|p| format!(" -> {}", p.display()))
+                        .unwrap_or_default()
+                ),
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn ih_pending_downloads() -> &'static std::sync::Mutex<std::collections::HashMap<String, PathBuf>> {
+    static PENDING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Show the saved file selected in Finder / Explorer. Best-effort: a failure here only costs
+/// the reveal, the file is already on disk.
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no file manager reveal on this platform",
+    ));
+    if let Err(e) = result {
+        eprintln!("[IH] could not reveal {}: {}", path.display(), e);
+    }
+}
+
 /// Shared chrome for hosted-chat windows built from Rust (the main window gets the same
 /// treatment from tauri.conf.json). On macOS the native title bar is hidden (Overlay +
 /// hidden title): the page's own titlebar strip — the chat repo's IhDesktopTitlebar
@@ -1340,7 +1411,7 @@ fn style_chat_window_builder(
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
-    builder
+    builder.on_download(ih_download_handler)
 }
 
 fn trigger_new_window(app: &AppHandle) {
@@ -2737,6 +2808,25 @@ fn main() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
+            // The main window is declared in tauri.conf.json with `create: false` and built
+            // HERE so a download handler can be attached — Tauri exposes on_download only on
+            // the builder, never on an existing webview. Same config, same chrome; everything
+            // below that looks the window up by label keeps working. Fatal if it fails: the
+            // app has no other window to show.
+            {
+                let main_cfg = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "main")
+                    .cloned()
+                    .ok_or("tauri.conf.json has no window labelled main")?;
+                WebviewWindowBuilder::from_config(&app_handle, &main_cfg)?
+                    .on_download(ih_download_handler)
+                    .build()?;
+            }
+
             if let Err(e) = setup_app_menu(&app_handle) {
                 eprintln!("Failed to setup menu: {}", e);
             }
@@ -2821,6 +2911,10 @@ fn main() {
             // the hidden-title-bar chrome it advertises.
             #[cfg(target_os = "macos")]
             let _ = webview.eval("window.__IH_DESKTOP__ = true;");
+
+            // Advertise the download handler (ih_download_handler) so the chat page can tell a
+            // shell that saves files from an older one that silently cancelled downloads.
+            let _ = webview.eval("window.__IH_DOWNLOADS__ = true;");
 
             // Belt for the native drag handle: re-assert on every page load (idempotent) in
             // case the window was created before the first install could attach it.
