@@ -2813,18 +2813,32 @@ fn main() {
             // the builder, never on an existing webview. Same config, same chrome; everything
             // below that looks the window up by label keeps working. Fatal if it fails: the
             // app has no other window to show.
-            {
-                let main_cfg = app
-                    .config()
-                    .app
-                    .windows
-                    .iter()
-                    .find(|w| w.label == "main")
-                    .cloned()
-                    .ok_or("tauri.conf.json has no window labelled main")?;
-                WebviewWindowBuilder::from_config(&app_handle, &main_cfg)?
-                    .on_download(ih_download_handler)
-                    .build()?;
+            //
+            // Platform overrides (tauri.<os>.conf.json) REPLACE the whole `app.windows` array
+            // under Tauri's RFC 7396 merge, so `create: false` must be repeated in each one —
+            // v0.2.23 forgot it in tauri.windows.conf.json, Tauri auto-created `main` from
+            // config, this builder hit WindowLabelAlreadyExists, setup failed and every Windows
+            // launch died after a black flash. Belt and braces now: the override carries the
+            // flag (unit-tested below), and if it ever drifts again the pre-created window is
+            // reused instead of aborting the launch — downloads degrade, the app still opens.
+            match app.get_webview_window("main") {
+                None => {
+                    let main_cfg = app
+                        .config()
+                        .app
+                        .windows
+                        .iter()
+                        .find(|w| w.label == "main")
+                        .cloned()
+                        .ok_or("tauri.conf.json has no window labelled main")?;
+                    WebviewWindowBuilder::from_config(&app_handle, &main_cfg)?
+                        .on_download(ih_download_handler)
+                        .build()?;
+                }
+                Some(_) => eprintln!(
+                    "[IH] main window was pre-created from config (platform override lost \
+                     `create: false`?) — reusing it; webview download handler NOT attached"
+                ),
             }
 
             if let Err(e) = setup_app_menu(&app_handle) {
@@ -3122,5 +3136,41 @@ mod tests {
         // no-plan shape
         let none: PlanStatusResponse = serde_json::from_str(r#"{"enabled":false,"plan":null}"#).unwrap();
         assert!(none.plan.is_none());
+    }
+
+    /// Tauri merges `tauri.<platform>.conf.json` over `tauri.conf.json` with RFC 7396 semantics:
+    /// arrays REPLACE, they do not merge. Every override that redeclares `app.windows` must
+    /// therefore carry the load-bearing keys of the base `main` window itself. Missing
+    /// `create: false` = double-create of `main` = dead-on-launch (v0.2.23 on Windows);
+    /// missing `dragDropEnabled: false` = native drop handler eats file drops (v0.2.7).
+    #[test]
+    fn platform_window_overrides_keep_load_bearing_main_window_keys() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let base_main = base["app"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["label"] == "main")
+            .expect("base conf declares main");
+        assert_eq!(base_main["create"], serde_json::Value::Bool(false));
+
+        for (name, text) in [("tauri.windows.conf.json", include_str!("../tauri.windows.conf.json"))] {
+            let over: serde_json::Value = serde_json::from_str(text).unwrap();
+            let Some(windows) = over["app"]["windows"].as_array() else {
+                continue; // override doesn't touch app.windows → base array survives intact
+            };
+            let main = windows
+                .iter()
+                .find(|w| w["label"] == "main")
+                .unwrap_or_else(|| panic!("{name} redeclares app.windows without main"));
+            for key in ["create", "dragDropEnabled"] {
+                assert_eq!(
+                    main[key], base_main[key],
+                    "{name}: main.{key} must match tauri.conf.json (arrays replace under merge)"
+                );
+            }
+            assert_eq!(main["backgroundColor"], base_main["backgroundColor"], "{name}: backgroundColor");
+        }
     }
 }

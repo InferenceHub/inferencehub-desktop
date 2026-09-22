@@ -5,6 +5,7 @@
       {
         "title": "InferenceHub",
         "label": "main",
+        "create": false,
         "url": "index.html",
         "width": 1200,
         "height": 800,
