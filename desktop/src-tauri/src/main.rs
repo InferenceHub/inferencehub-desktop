@@ -44,8 +44,8 @@ use tauri::tray::TrayIconBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::Wry;
 use tauri::{
-    webview::DownloadEvent, webview::PageLoadPayload, AppHandle, Manager, Webview, WebviewUrl,
-    WebviewWindowBuilder,
+    webview::DownloadEvent, webview::NewWindowFeatures, webview::NewWindowResponse,
+    webview::PageLoadPayload, AppHandle, Manager, Webview, WebviewUrl, WebviewWindowBuilder,
 };
 use url::Url;
 #[cfg(target_os = "macos")]
@@ -118,137 +118,6 @@ fn gateway_base_url() -> String {
 /// Readiness poll parameters: wait up to 30 s in 250 ms intervals.
 const POLL_INTERVAL_MS: u64 = 250;
 const POLL_TIMEOUT_SECS: u64 = 30;
-
-const CHAT_LINK_INTERCEPT_SCRIPT: &str = r##"
-(() => {
-  if (window.__IH_CHAT_LINK_INTERCEPT_INSTALLED__) {
-    return;
-  }
-
-  window.__IH_CHAT_LINK_INTERCEPT_INSTALLED__ = true;
-
-  function isChatSessionPage() {
-    try {
-      const currentUrl = new URL(window.location.href);
-      return (
-        currentUrl.pathname.startsWith("/app") &&
-        currentUrl.searchParams.has("chatId")
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  function getAllowedNavigationUrl(rawUrl) {
-    try {
-      const parsed = new URL(String(rawUrl), window.location.href);
-      const scheme = parsed.protocol.toLowerCase();
-      if (!["http:", "https:", "mailto:", "tel:"].includes(scheme)) {
-        return null;
-      }
-      return parsed;
-    } catch {
-      return null;
-    }
-  }
-
-  async function openWithTauri(url) {
-    try {
-      const invoke =
-        window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
-      if (typeof invoke !== "function") {
-        return false;
-      }
-
-      await invoke("open_in_browser", { url });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  function handleChatNavigation(rawUrl) {
-    const parsedUrl = getAllowedNavigationUrl(rawUrl);
-    if (!parsedUrl) {
-      return false;
-    }
-
-    const safeUrl = parsedUrl.toString();
-    const scheme = parsedUrl.protocol.toLowerCase();
-    if (scheme === "mailto:" || scheme === "tel:") {
-      void openWithTauri(safeUrl).then((opened) => {
-        if (!opened) {
-          window.location.assign(safeUrl);
-        }
-      });
-      return true;
-    }
-
-    window.location.assign(safeUrl);
-    return true;
-  }
-
-  document.addEventListener(
-    "click",
-    (event) => {
-      if (!isChatSessionPage() || event.defaultPrevented) {
-        return;
-      }
-
-      const element = event.target;
-      if (!(element instanceof Element)) {
-        return;
-      }
-
-      const anchor = element.closest("a");
-      if (!(anchor instanceof HTMLAnchorElement)) {
-        return;
-      }
-
-      const target = (anchor.getAttribute("target") || "").toLowerCase();
-      if (target !== "_blank") {
-        return;
-      }
-
-      const href = anchor.getAttribute("href");
-      if (!href || href.startsWith("#")) {
-        return;
-      }
-
-      if (!handleChatNavigation(href)) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-    },
-    true
-  );
-
-  const nativeWindowOpen = window.open;
-  window.open = function(url, target, features) {
-    const resolvedTarget = typeof target === "string" ? target.toLowerCase() : "";
-    const shouldNavigateInPlace = resolvedTarget === "" || resolvedTarget === "_blank";
-
-    if (
-      isChatSessionPage() &&
-      shouldNavigateInPlace &&
-      url != null &&
-      String(url).length > 0
-    ) {
-      if (!handleChatNavigation(url)) {
-        return null;
-      }
-      return null;
-    }
-
-    if (typeof nativeWindowOpen === "function") {
-      return nativeWindowOpen.call(window, url, target, features);
-    }
-    return null;
-  };
-})();
-"##;
 
 #[cfg(not(target_os = "macos"))]
 const MENU_KEY_HANDLER_SCRIPT: &str = r#"
@@ -998,12 +867,6 @@ fn inject_console_capture(webview: &Webview) {
     let _ = webview.eval(CONSOLE_CAPTURE_SCRIPT);
 }
 
-/// External-link interception. v1 no-op: the app navigates only within the local
-/// sidecar (127.0.0.1), so in-webview navigation is the common case. TODO(polish):
-/// route external (non-localhost) links to the system browser via
-/// tauri-plugin-shell. Defined here so the `on_page_load` hook resolves.
-fn inject_chat_link_intercept(_webview: &Webview) {}
-
 fn maybe_open_devtools(app: &AppHandle, window: &tauri::WebviewWindow) {
     #[cfg(any(debug_assertions, feature = "devtools"))]
     {
@@ -1401,47 +1264,29 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 /// overlay, activated by the user-agent marker — becomes the window chrome, and dragging
 /// is handled natively by install_drag_handle (Tauri v2 injects no IPC into remote
 /// origins, so the capability in capabilities/ih-remote-chat.json alone is inert — #6).
-/// Other platforms keep the standard decorated window untouched.
-fn style_chat_window_builder(
-    builder: WebviewWindowBuilder<'_, tauri::Wry, AppHandle>,
-) -> WebviewWindowBuilder<'_, tauri::Wry, AppHandle> {
+/// Other platforms keep the standard decorated window untouched. Every platform gets the
+/// two builder-only webview hooks: downloads (ih_download_handler) and new-window requests
+/// (ih_new_window_handler — links out of the chat).
+fn style_chat_window_builder<'a>(
+    app: &AppHandle,
+    builder: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
     #[cfg(target_os = "macos")]
     let builder = builder
         .user_agent(IH_WEBVIEW_USER_AGENT)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
-    builder.on_download(ih_download_handler)
+    builder
+        .on_download(ih_download_handler)
+        .on_new_window(ih_new_window_handler(app.clone()))
 }
 
 fn trigger_new_window(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let base = state
-        .server_base_url
-        .read()
-        .unwrap()
-        .clone()
-        .unwrap_or_default();
-    let handle = app.clone();
-
-    tauri::async_runtime::spawn(async move {
-        let window_label = format!("ih-{}", uuid::Uuid::new_v4());
-        let builder = WebviewWindowBuilder::new(
-            &handle,
-            &window_label,
-            WebviewUrl::External(base.parse().unwrap_or("http://127.0.0.1".parse().unwrap())),
-        )
-        .title("InferenceHub")
-        .inner_size(1200.0, 800.0)
-        .min_inner_size(800.0, 600.0);
-        let builder = style_chat_window_builder(builder);
-
-        if let Ok(window) = builder.build() {
-            apply_settings_to_window(&handle, &window);
-            maybe_open_devtools(&handle, &window);
-            let _ = window.set_focus();
-        }
-    });
+    match chat_base_url(app) {
+        Some(url) => spawn_chat_window(app, url),
+        None => eprintln!("[IH] New Window: the configured chat URL does not parse"),
+    }
 }
 
 fn open_in_default_browser(url: &str) -> bool {
@@ -1471,19 +1316,116 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn is_chat_session_url(url: &Url) -> bool {
-    url.path().starts_with("/app") && url.query_pairs().any(|(key, _)| key == "chatId")
+// ============================================================================
+// Links out of the chat page — target="_blank" anchors and window.open()
+// ============================================================================
+//
+// Every outbound link the hosted chat renders asks for a NEW window: markdown links in answers
+// are `<a target="_blank">`, citations and web-search / fetch result cards call
+// `window.open(url, "_blank")` (Onyx MemoizedTextComponents.tsx, lib/search/utils.ts openDocument,
+// the search/fetch tool renderers). Those requests never reach the webview's own navigation
+// policy — WKWebView routes them to the UI delegate's createWebViewWithConfiguration, WebView2
+// to NewWindowRequested — and wry answers both with "no window" when the app registers no
+// handler (nil on macOS, SetHandled(true) on Windows). So through v0.2.24 every link in an
+// answer was a silent no-op and users copied URLs out by hand.
+//
+// `ih_new_window_handler` is attached to every chat window builder and decides per URL:
+//   - http(s) off the chat origin, mailto:, tel:  → the OS default browser / mail / phone handler
+//   - http(s) on the chat origin                  → another in-app chat window (shares the session
+//                                                   cookies — the system browser holds no login for
+//                                                   e.g. /api/chat/file/… attachment links)
+//   - anything else (javascript:, file:, about:blank, custom schemes) → dropped
+// and always answers Deny: wry never gets to conjure a bare, chrome-less popup window.
+
+/// Where a new-window request from the chat page should land. See `classify_new_window_url`.
+#[derive(Debug, PartialEq, Eq)]
+enum NewWindowTarget {
+    SystemBrowser,
+    ChatWindow,
+    Block,
 }
 
-fn should_open_in_external_browser(current_url: &Url, destination_url: &Url) -> bool {
-    if !is_chat_session_url(current_url) {
-        return false;
+fn classify_new_window_url(chat_origin: Option<&Url>, destination: &Url) -> NewWindowTarget {
+    match destination.scheme() {
+        "http" | "https" => {
+            if chat_origin.is_some_and(|base| same_origin(base, destination)) {
+                NewWindowTarget::ChatWindow
+            } else {
+                NewWindowTarget::SystemBrowser
+            }
+        }
+        "mailto" | "tel" => NewWindowTarget::SystemBrowser,
+        _ => NewWindowTarget::Block,
     }
-    match destination_url.scheme() {
-        "mailto" | "tel" => true,
-        "http" | "https" => !same_origin(current_url, destination_url),
-        _ => false,
+}
+
+/// The hosted chat origin this app points at (IH_SERVER_URL override or the default), parsed.
+fn chat_base_url(app: &AppHandle) -> Option<Url> {
+    let configured: Option<String> = match app.try_state::<AppState>() {
+        Some(state) => state
+            .server_base_url
+            .read()
+            .ok()
+            .and_then(|url| (*url).clone()),
+        None => None,
+    };
+    configured
+        .as_deref()
+        .unwrap_or(DEFAULT_SERVER_URL)
+        .parse()
+        .ok()
+}
+
+/// Hand `url` to the OS default handler off the UI thread: the new-window delegate runs on it
+/// and `open` / `rundll32` block until they have handed off. Fire-and-forget, failures logged.
+fn open_in_default_browser_async(url: Url) {
+    std::thread::spawn(move || {
+        if !open_in_default_browser(url.as_str()) {
+            eprintln!("[IH] could not hand {} to the default browser", url);
+        }
+    });
+}
+
+/// New-window request handler for every hosted-chat window (main + `ih-*`). See the section note.
+fn ih_new_window_handler(
+    app: AppHandle,
+) -> impl Fn(Url, NewWindowFeatures) -> NewWindowResponse<Wry> + Send + 'static {
+    move |url, _features| {
+        match classify_new_window_url(chat_base_url(&app).as_ref(), &url) {
+            NewWindowTarget::SystemBrowser => open_in_default_browser_async(url),
+            NewWindowTarget::ChatWindow => spawn_chat_window(&app, url),
+            NewWindowTarget::Block => {
+                eprintln!(
+                    "[IH] dropped new-window request with scheme {}:",
+                    url.scheme()
+                )
+            }
+        }
+        NewWindowResponse::Deny
     }
+}
+
+/// Open another hosted-chat window at `url`: an `ih-*` window with the shared chat chrome. Safe
+/// to call from any thread (Tauri hops window creation onto the main thread).
+fn spawn_chat_window(app: &AppHandle, url: Url) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let window_label = format!("ih-{}", uuid::Uuid::new_v4());
+        let builder = WebviewWindowBuilder::new(&handle, &window_label, WebviewUrl::External(url))
+            .title("InferenceHub")
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(800.0, 600.0);
+        let builder = style_chat_window_builder(&handle, builder);
+
+        match builder.build() {
+            Ok(window) => {
+                apply_settings_to_window(&handle, &window);
+                maybe_open_devtools(&handle, &window);
+                let _ = window.set_focus();
+            }
+            Err(e) => eprintln!("[IH] could not open a chat window: {}", e),
+        }
+    });
 }
 
 // ============================================================================
@@ -1722,7 +1664,7 @@ async fn new_window(app: AppHandle, state: tauri::State<'_, AppState>) -> Result
     .title("InferenceHub")
     .inner_size(1200.0, 800.0)
     .min_inner_size(800.0, 600.0);
-    let builder = style_chat_window_builder(builder);
+    let builder = style_chat_window_builder(&app, builder);
 
     let window = builder.build().map_err(|e| e.to_string())?;
 
@@ -2716,6 +2658,14 @@ fn main() {
                         }
                         return false;
                     }
+                    // mailto:/tel: links WITHOUT target="_blank" navigate this webview itself,
+                    // which neither WebKit nor WebView2 can render — hand them to the OS handler
+                    // and cancel. (The _blank variants and every http(s) link out of the chat
+                    // arrive as new-window requests instead: see ih_new_window_handler.)
+                    if matches!(destination_url.scheme(), "mailto" | "tel") {
+                        open_in_default_browser_async(destination_url.clone());
+                        return false;
+                    }
                     // Allow all other in-webview navigation.
                     true
                 })
@@ -2809,10 +2759,10 @@ fn main() {
             let app_handle = app.handle().clone();
 
             // The main window is declared in tauri.conf.json with `create: false` and built
-            // HERE so a download handler can be attached — Tauri exposes on_download only on
-            // the builder, never on an existing webview. Same config, same chrome; everything
-            // below that looks the window up by label keeps working. Fatal if it fails: the
-            // app has no other window to show.
+            // HERE so the download and new-window handlers can be attached — Tauri exposes
+            // on_download / on_new_window only on the builder, never on an existing webview.
+            // Same config, same chrome; everything below that looks the window up by label
+            // keeps working. Fatal if it fails: the app has no other window to show.
             //
             // Platform overrides (tauri.<os>.conf.json) REPLACE the whole `app.windows` array
             // under Tauri's RFC 7396 merge, so `create: false` must be repeated in each one —
@@ -2833,11 +2783,12 @@ fn main() {
                         .ok_or("tauri.conf.json has no window labelled main")?;
                     WebviewWindowBuilder::from_config(&app_handle, &main_cfg)?
                         .on_download(ih_download_handler)
+                        .on_new_window(ih_new_window_handler(app_handle.clone()))
                         .build()?;
                 }
                 Some(_) => eprintln!(
                     "[IH] main window was pre-created from config (platform override lost \
-                     `create: false`?) — reusing it; webview download handler NOT attached"
+                     `create: false`?) — reusing it; download + new-window handlers NOT attached"
                 ),
             }
 
@@ -2918,8 +2869,6 @@ fn main() {
             Ok(())
         })
         .on_page_load(|webview: &Webview, payload: &PageLoadPayload| {
-            inject_chat_link_intercept(webview);
-
             // Belt to the user-agent marker: lets the hosted chat frontend detect the
             // desktop shell even if the UA is ever normalized away. macOS-only, matching
             // the hidden-title-bar chrome it advertises.
@@ -3118,6 +3067,81 @@ mod tests {
         assert!(old.status.is_none());
         // favicon / tokenless requests keep waiting
         assert!(parse_tokens_from_request("GET /favicon.ico HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn new_window_links_off_the_chat_origin_go_to_the_system_browser() {
+        let chat = u("https://chat.inferencehub.tech");
+        for dest in [
+            "https://example.com/article?x=1#frag",
+            "http://example.com/",
+            // The gateway is a different origin: the user's browser session lives there.
+            "https://app.inferencehub.tech/portal",
+            // Origin = scheme + host + port: either differing means "not the chat".
+            "https://chat.inferencehub.tech:8443/",
+            "http://chat.inferencehub.tech/",
+            "mailto:support@inferencehub.tech",
+            "tel:+15555550100",
+        ] {
+            assert_eq!(
+                classify_new_window_url(Some(&chat), &u(dest)),
+                NewWindowTarget::SystemBrowser,
+                "{dest}"
+            );
+        }
+        // No chat origin known at all: still never swallow a web link.
+        assert_eq!(
+            classify_new_window_url(None, &u("https://example.com/")),
+            NewWindowTarget::SystemBrowser
+        );
+    }
+
+    #[test]
+    fn new_window_links_on_the_chat_origin_open_another_chat_window() {
+        let chat = u("https://chat.inferencehub.tech");
+        for dest in [
+            "https://chat.inferencehub.tech/app?chatId=abc",
+            "https://chat.inferencehub.tech:443/api/chat/file/123", // default port spelled out
+        ] {
+            assert_eq!(
+                classify_new_window_url(Some(&chat), &u(dest)),
+                NewWindowTarget::ChatWindow,
+                "{dest}"
+            );
+        }
+        // IH_SERVER_URL dev override: same host AND port is the chat, a neighbouring port is not.
+        let dev = u("http://localhost:3000");
+        assert_eq!(
+            classify_new_window_url(Some(&dev), &u("http://localhost:3000/app")),
+            NewWindowTarget::ChatWindow
+        );
+        assert_eq!(
+            classify_new_window_url(Some(&dev), &u("http://localhost:3001/app")),
+            NewWindowTarget::SystemBrowser
+        );
+    }
+
+    #[test]
+    fn new_window_requests_for_non_web_schemes_are_dropped() {
+        let chat = u("https://chat.inferencehub.tech");
+        for dest in [
+            "about:blank",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,hi",
+            "x-apple.systempreferences:com.apple.preference.security",
+            "ssh://host",
+        ] {
+            assert_eq!(
+                classify_new_window_url(Some(&chat), &u(dest)),
+                NewWindowTarget::Block,
+                "{dest}"
+            );
+        }
     }
 
     #[test]
