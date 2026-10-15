@@ -46,6 +46,7 @@ xattr -dr com.apple.quarantine /Applications/InferenceHub.app
 | --- | --- | --- |
 | Chat (frontier + open-weight), web search, deep research, projects | ✅ | ✅ |
 | Single sign-on via your system browser | ✅ | ✅ |
+| Links in answers, citations and search results open in your default browser | ✅ | ✅ |
 | Tray with live plan budget / runway | ✅ (menu-bar title + menu) | ✅ (tray menu) |
 | Live transcription (on-device whisper.cpp) | ✅ | — |
 | Stealth Mode (hide window from screen shares, ⌘.) | ✅ | — |
